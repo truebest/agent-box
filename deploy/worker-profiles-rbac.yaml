@@ -1,0 +1,51 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: panel-worker-profiles
+  namespace: pvm-agents
+rules:
+- apiGroups: [ate.dev]
+  resources: [workerpools]
+  verbs: [get, list, create, delete]
+- apiGroups: ['']
+  resources: [configmaps]
+  verbs: [get, list, update]
+- apiGroups: [coordination.k8s.io]
+  resources: [leases]
+  verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: panel-worker-profiles
+  namespace: pvm-agents
+subjects:
+- kind: ServiceAccount
+  name: panel
+  namespace: pvm-agents
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: panel-worker-profiles
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: panel-worker-budget
+rules:
+- apiGroups: ['']
+  resources: [nodes, pods]
+  verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: panel-worker-budget
+subjects:
+- kind: ServiceAccount
+  name: panel
+  namespace: pvm-agents
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: panel-worker-budget

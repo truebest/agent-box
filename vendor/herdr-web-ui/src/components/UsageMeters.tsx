@@ -1,0 +1,179 @@
+import { useEffect, useRef, useState, type CSSProperties, type FocusEvent, type KeyboardEvent } from "react";
+import { RefreshCw } from "lucide-react";
+
+import "./UsageMeters.css";
+
+import type { ProviderUsage, UsageWindow } from "../../shared/protocol.ts";
+import { useT, type Translate } from "../lib/i18n.ts";
+import { useSettings, type UsageCount, type UsageGlance } from "../lib/settings.ts";
+import { formatPercent, formatRate, formatResetIn, formatRunsOut, glanceWindow, HIGH_PERCENT, meterPercent, meterText, orderProviders, PROVIDER_MARK, PROVIDER_NAME, usageName, useUsage, windowLabel, windowPace } from "../lib/usage.ts";
+import { AgentMark } from "./AgentMark.tsx";
+
+/** chips the strip beside Settings holds before the rest fold into "+N" */
+const MAX_CHIPS = 4;
+
+function level(window: UsageWindow | null): string {
+  return window !== null && window.used_percent >= HIGH_PERCENT ? " is-high" : "";
+}
+
+/** Why the numbers shown are old or missing; null while they are fresh. */
+function problemText(t: Translate, usage: ProviderUsage): string | null {
+  const name = PROVIDER_NAME[usage.id];
+  return usage.problem === "expired" ? t("Sign-in expired. Open {name} to renew it.", { name })
+    : usage.problem === "rate_limited" ? t("{name} asked to slow down. These are the last numbers.", { name })
+    : usage.problem === "failed" ? t("{name} could not be reached.", { name })
+    : usage.problem === "locked" ? t("The server cannot open the keychain holding this sign-in.")
+    : null;
+}
+
+/** An expired sign-in or an unreachable provider is an error; slowed down or locked, the last numbers stand. */
+function isError(usage: ProviderUsage): boolean {
+  return usage.problem === "expired" || usage.problem === "failed";
+}
+
+/** "Runs out in 2d 4h" when the limit runs out before it resets at the pace so far; null when it lasts. */
+function runsOutText(usage: ProviderUsage, window: UsageWindow | null, now: number): string | null {
+  return window && formatRunsOut(window, usage.checked_at, now);
+}
+
+function Chip({ usage, count, glance, now, paced }: { usage: ProviderUsage; count: UsageCount; glance: UsageGlance; now: number; paced: boolean }) {
+  const window = glanceWindow(usage, glance);
+  // the hairline warns of a limit that runs out before it resets while its share is still low
+  const fast = paced && runsOutText(usage, window, now) !== null;
+  return (
+    <span className={`usage-chip${level(window)}${fast ? " is-fast" : ""}${usage.problem ? " has-problem" : ""}`}>
+      <AgentMark agent={PROVIDER_MARK[usage.id]} size={14} />
+      <span className="usage-chip-value">{window ? formatPercent(meterPercent(window, count)) : "—"}</span>
+      <span className="usage-chip-bar" style={{ "--fill": `${window ? meterPercent(window, count) : 0}%` } as CSSProperties} />
+    </span>
+  );
+}
+
+function Provider({ usage, now, count, paced }: { usage: ProviderUsage; now: number; count: UsageCount; paced: boolean }) {
+  const t = useT();
+  const name = PROVIDER_NAME[usage.id];
+  const problem = problemText(t, usage);
+  return (
+    <section className="usage-provider" aria-label={usageName(usage)}>
+      <header className="usage-provider-head">
+        <AgentMark agent={PROVIDER_MARK[usage.id]} size={16} />
+        <span className="usage-provider-name">{name}</span>
+        {usage.plan && <span className="usage-plan">{usage.plan}</span>}
+        {usage.account && <span className="usage-account" title={usage.account}>{usage.account}</span>}
+      </header>
+      {problem && <p className={`usage-note${isError(usage) ? " is-problem" : ""}`}>{problem}</p>}
+      {usage.windows.map((window, index) => {
+        const reset = formatResetIn(window.resets_at, now);
+        const value = meterPercent(window, count);
+        // Settings → Subscription usage → Show pace, off by default
+        const pace = paced ? windowPace(window, usage.checked_at, now) : null;
+        const runsOut = paced ? runsOutText(usage, window, now) : null;
+        return (
+          <div key={index} className={`usage-row${level(window)}`}>
+            <span className="usage-row-label">{windowLabel(window)}</span>
+            {reset && <span className="usage-row-reset">{t("Resets in {time}", { time: reset })}</span>}
+            <span className="usage-row-value">{meterText(window, count)}</span>
+            <span className="usage-bar" role="meter" aria-label={windowLabel(window)} aria-valuemin={0} aria-valuemax={100} aria-valuenow={value} aria-valuetext={meterText(window, count)}>
+              {/* a sliver above 0 still shows as a bar, not a dot */}
+              <span style={{ width: value > 0 ? `max(4px, ${value}%)` : 0 }} />
+              {/* where an even pace would be by now, counted as the bar counts: used past it, or left short of it, is ahead of pace */}
+              {pace && <i className="usage-bar-pace" style={{ left: `${count === "left" ? 100 - pace.elapsed * 100 : pace.elapsed * 100}%` }} />}
+            </span>
+            {pace && pace.perHour > 0 && (
+              <span className="usage-row-pace">
+                {formatRate(window, pace)}
+                {runsOut && <span className="usage-row-runs-out"> · {runsOut}</span>}
+              </span>
+            )}
+          </div>
+        );
+      })}
+      {usage.windows.length === 0 && !problem && <p className="usage-note">{t("No limits reported")}</p>}
+    </section>
+  );
+}
+
+/**
+ * The plan limits of the subscriptions signed in on the server's PC, beside Settings: per
+ * provider its logo and the limit chosen in Settings (week or session); the whole strip opens every limit
+ * with its reset time.
+ */
+export function UsageMeters() {
+  const t = useT();
+  const { settings } = useSettings();
+  const { report, loading, refresh } = useUsage(settings.showUsage);
+  const [open, setOpen] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+  const rootRef = useRef<HTMLDivElement>(null);
+  const stripRef = useRef<HTMLButtonElement>(null);
+
+  // turned off in Settings, the popover closes: its listener and the clock go with it
+  useEffect(() => { if (!settings.showUsage) setOpen(false); }, [settings.showUsage]);
+  // reset countdowns and run-out warnings move on between reports, popover closed or open
+  useEffect(() => {
+    if (!settings.showUsage) return;
+    setNow(Date.now());
+    const tick = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(tick);
+  }, [settings.showUsage, open]);
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent): void => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [open]);
+
+  // Escape and focus belong to the meters only while focus is in them: other dialogs keep theirs
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
+    if (event.key !== "Escape" || !open) return;
+    event.stopPropagation();
+    setOpen(false);
+    stripRef.current?.focus();
+  };
+  const onBlur = (event: FocusEvent<HTMLDivElement>): void => {
+    if (event.relatedTarget instanceof Node && !event.currentTarget.contains(event.relatedTarget)) setOpen(false);
+  };
+
+  const count = settings.usageCount;
+  // an account hidden in Settings is left out of the strip and the popover alike
+  const shown = report ? orderProviders(report.providers, settings.usageOrder).filter((usage) => !settings.usageHidden.includes(usage.key)) : [];
+  if (!settings.showUsage || shown.length === 0) return null;
+  const folded = shown.length > MAX_CHIPS ? shown.length - (MAX_CHIPS - 1) : 0;
+  const chips = folded > 0 ? shown.slice(0, MAX_CHIPS - 1) : shown;
+  const summary = shown.map((usage) => {
+    const window = glanceWindow(usage, settings.usageGlance);
+    const runsOut = settings.usagePace ? runsOutText(usage, window, now) : null;
+    return `${usageName(usage)} ${window ? meterText(window, count) : "—"}${runsOut ? ` (${runsOut})` : ""}`;
+  }).join(", ");
+
+  return (
+    <div className="usage" ref={rootRef} onKeyDown={onKeyDown} onBlur={onBlur}>
+      <button
+        ref={stripRef}
+        type="button"
+        className="usage-strip"
+        aria-expanded={open}
+        aria-label={`${t("Subscription usage")}: ${summary}`}
+        title={summary}
+        onClick={() => setOpen(!open)}
+      >
+        {chips.map((usage) => <Chip key={usage.key} usage={usage} count={count} glance={settings.usageGlance} now={now} paced={settings.usagePace} />)}
+        {folded > 0 && <span className="usage-more">+{folded}</span>}
+      </button>
+      {open && (
+        <div className="usage-popover" role="dialog" aria-label={t("Subscription usage")}>
+          <header className="usage-popover-head">
+            <span>{t("Subscription usage")}</span>
+            {/* busy, not disabled: a disabled button drops focus, and Escape with it */}
+            <button type="button" className="icon-button" aria-label={t("Refresh")} title={t("Refresh")} aria-busy={loading} onClick={() => { if (!loading) refresh(); }}>
+              <RefreshCw aria-hidden="true" className={loading ? "is-spinning" : undefined} />
+            </button>
+          </header>
+          {shown.map((usage) => <Provider key={usage.key} usage={usage} now={now} count={count} paced={settings.usagePace} />)}
+        </div>
+      )}
+    </div>
+  );
+}

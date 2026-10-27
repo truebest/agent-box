@@ -1,0 +1,137 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared-agent-box
+  namespace: pvm-agents
+  labels:
+    app: cloudflared-agent-box
+    agent-box.dev/tunnel-id: 00000000-0000-4000-8000-000000000002
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloudflared-agent-box
+  template:
+    metadata:
+      labels:
+        app: cloudflared-agent-box
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: cloudflared
+        image: cloudflare/cloudflared:2026.10.4@sha256:4c72c1af2984a66a255efd20fc4ec73fe0f7267384b55315ad953b354b3361b4
+        args:
+        - tunnel
+        - --no-autoupdate
+        - --loglevel
+        - warn
+        - --metrics
+        - 0.0.0.0:2000
+        - run
+        - --token-file
+        - /run/tunnel/token
+        ports:
+        - name: metrics
+          containerPort: 2000
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          requests:
+            cpu: 100m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        startupProbe:
+          httpGet:
+            path: /ready
+            port: metrics
+          periodSeconds: 5
+          failureThreshold: 60
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: metrics
+          periodSeconds: 10
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /ready
+            port: metrics
+          periodSeconds: 30
+          failureThreshold: 3
+        volumeMounts:
+        - name: token
+          mountPath: /run/tunnel
+          readOnly: true
+        - name: ca
+          mountPath: /etc/agent-box-ca
+          readOnly: true
+      volumes:
+      - name: token
+        secret:
+          secretName: agent-box-cloudflare-token
+          defaultMode: 288
+      - name: ca
+        configMap:
+          name: agent-box-tunnel-ca
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cloudflared-agent-box
+  namespace: pvm-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: cloudflared-agent-box
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress: []
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - to:
+    - ipBlock:
+        cidr: 192.0.2.10/32
+    ports:
+    - protocol: TCP
+      port: 8443
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 127.0.0.0/8
+        - 169.254.0.0/16
+    ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 7844
+    - protocol: UDP
+      port: 7844

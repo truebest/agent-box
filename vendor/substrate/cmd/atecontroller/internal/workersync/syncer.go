@@ -1,0 +1,586 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package workersync reconciles Kubernetes worker pods into the Worker registry
+// behind the ateapi Control API.
+package workersync
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"maps"
+	"slices"
+	"time"
+
+	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
+)
+
+// workerPodLabel names the WorkerPool a worker pod belongs to. Its presence is
+// also what marks a pod as a worker pod at all, so it doubles as the selector
+// the pod informer is narrowed by.
+const workerPodLabel = "ate.dev/worker-pool"
+
+// workerPoolIndex maps a WorkerPool namespace/name to the worker Pods labeled
+// as members of that pool.
+const workerPoolIndex = "worker-pool"
+
+// workerKey identifies the pod incarnation a queued event concerns. namespace
+// and name locate the pod in the informer, which is indexed by namespace/name
+// rather than by UID.
+//
+// uid belongs in the key because the workqueue dedupes by key equality. A pod
+// and its same-named replacement are different Workers, and including the UID
+// is what makes the queue treat them that way: without it, the delete of
+// worker-1(uid-A) and the add of worker-1(uid-B) would collapse into a single
+// item, and the reconcile — which reads current informer state — would see
+// only uid-B and leave uid-A's record orphaned in the registry.
+type workerKey struct {
+	namespace string
+	name      string
+	uid       string
+}
+
+// workerName is the resource name of the Worker this key identifies.
+//
+// The syncer mints Workers from Pods, so it is what gives them their names, and
+// it names them after the pod UID. This method and createOrUpdateWorker are the
+// only places that choice is expressed: everywhere else a Worker name is opaque
+// and must be carried rather than rebuilt from pod identity.
+func (k workerKey) workerName() string { return k.uid }
+
+// workerRef is the Worker this key identifies, in the form the API's
+// single-resource requests take. Workers are global-scoped, so no atespace.
+func (k workerKey) workerRef() *ateapipb.ObjectRef {
+	return &ateapipb.ObjectRef{Name: k.workerName()}
+}
+
+// logAttrs identifies the Worker in a log line, along with the pod it is
+// derived from. The pod is the useful handle for an operator reaching for
+// kubectl; the name is what identifies the record the syncer is acting on.
+func (k workerKey) logAttrs() []any {
+	return []any{
+		slog.String("worker", k.workerName()),
+		slog.String("pod", k.namespace+"/"+k.name),
+	}
+}
+
+// WorkerPoolSyncer reconciles the state of worker pods from Kubernetes Informer
+// into the Worker registry, over the ateapi Control API.
+//
+// Informer event handlers only enqueue keys; worker goroutines reconcile each
+// key against the current informer cache state, requeuing with rate-limited
+// backoff on transient failures such as a lost version precondition. The queue
+// never hands the same key to two workers concurrently, so per-key ordering is
+// preserved regardless of workerCount.
+type WorkerPoolSyncer struct {
+	client             ateapipb.ControlClient
+	pods               corev1client.PodsGetter
+	workerInformer     cache.SharedIndexInformer
+	workerPoolInformer cache.SharedIndexInformer
+	queue              workqueue.TypedRateLimitingInterface[workerKey]
+	workerCount        int
+
+	// Exponential backoff schedule for retrying a failed page of the startup
+	// registered-worker scan. Per-syncer rather than package-level so a test
+	// can shrink it without writing state another test's syncer is reading.
+	listBackoff time.Duration
+	listCap     time.Duration
+}
+
+// NewWorkerPoolSyncer creates a new WorkerPoolSyncer. pods is used to delete
+// worker pods that have reached a terminal phase.
+func NewWorkerPoolSyncer(client ateapipb.ControlClient, pods corev1client.PodsGetter, workerInformer, workerPoolInformer cache.SharedIndexInformer, workerCount int) *WorkerPoolSyncer {
+	return &WorkerPoolSyncer{
+		client:             client,
+		pods:               pods,
+		workerInformer:     workerInformer,
+		workerPoolInformer: workerPoolInformer,
+		queue:              workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[workerKey]()),
+		workerCount:        workerCount,
+		listBackoff:        defaultListBackoff,
+		listCap:            defaultListCap,
+	}
+}
+
+// Start registers the event handlers and starts the background workers. The
+// informer's initial list synthesizes Add events for every existing pod, so no
+// explicit startup re-list is needed as long as Start is called before the
+// informer factory is started.
+func (s *WorkerPoolSyncer) Start(ctx context.Context) {
+	s.workerInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			s.enqueuePod(obj.(*corev1.Pod))
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldPod := oldObj.(*corev1.Pod)
+			newPod := newObj.(*corev1.Pod)
+			// A pod's UID never changes, but a coalesced Delete+Create of the
+			// same pod name surfaces here as an update. The two incarnations
+			// have distinct keys, so enqueue the old one too to clean up its
+			// now-orphaned registry record.
+			if oldPod.UID != newPod.UID {
+				s.enqueuePod(oldPod)
+			}
+			s.enqueuePod(newPod)
+		},
+		DeleteFunc: func(obj interface{}) {
+			var pod *corev1.Pod
+			switch t := obj.(type) {
+			case *corev1.Pod:
+				pod = t
+			case cache.DeletedFinalStateUnknown:
+				var ok bool
+				pod, ok = t.Obj.(*corev1.Pod)
+				if !ok {
+					slog.ErrorContext(ctx, "Failed to cast DeletedFinalStateUnknown object to Pod")
+					return
+				}
+			default:
+				slog.ErrorContext(ctx, "Unknown object type in delete handler", slog.Any("obj", obj))
+				return
+			}
+			s.enqueuePod(pod)
+		},
+	})
+	s.workerPoolInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    s.enqueueWorkerPool,
+		UpdateFunc: func(_, obj interface{}) { s.enqueueWorkerPool(obj) },
+	})
+
+	go func() {
+		defer s.queue.ShutDown()
+		if !cache.WaitForCacheSync(ctx.Done(), s.workerInformer.HasSynced) {
+			slog.ErrorContext(ctx, "Syncer: failed to sync informer cache")
+			return
+		}
+		for range s.workerCount {
+			go wait.UntilWithContext(ctx, s.runWorker, time.Second)
+		}
+
+		// Reconcile the other direction: enqueue every registered worker so
+		// records whose pods no longer exist are cleaned up. This recovers
+		// delete events missed while ate-controller was down — neither the watch
+		// relist nor the resync period can replay a delete across a process
+		// restart, because the informer cache starts empty. Runs after the cache
+		// sync so the indexer is an authoritative snapshot of live pods.
+		s.enqueueRegisteredWorkers(ctx)
+
+		<-ctx.Done()
+	}()
+}
+
+// enqueueWorkerPool schedules every current pod in pool.
+func (s *WorkerPoolSyncer) enqueueWorkerPool(obj interface{}) {
+	pool, ok := obj.(*atev1alpha1.WorkerPool)
+	if !ok {
+		slog.Error("Syncer: unexpected WorkerPool informer object", slog.Any("obj", obj))
+		return
+	}
+	pods, err := s.workerInformer.GetIndexer().ByIndex(workerPoolIndex, pool.Namespace+"/"+pool.Name)
+	if err != nil {
+		slog.Error("Syncer: listing pods for WorkerPool update", "workerPool", pool.Namespace+"/"+pool.Name, "err", err)
+		return
+	}
+	for _, obj := range pods {
+		s.enqueuePod(obj.(*corev1.Pod))
+	}
+}
+
+func (s *WorkerPoolSyncer) enqueuePod(pod *corev1.Pod) {
+	s.queue.Add(workerKey{namespace: pod.Namespace, name: pod.Name, uid: string(pod.UID)})
+}
+
+func (s *WorkerPoolSyncer) runWorker(ctx context.Context) {
+	for s.processNextWorkItem(ctx) {
+	}
+}
+
+func (s *WorkerPoolSyncer) processNextWorkItem(ctx context.Context) bool {
+	key, quit := s.queue.Get()
+	if quit {
+		return false
+	}
+	defer s.queue.Done(key)
+
+	if err := s.reconcile(ctx, key); err != nil {
+		// The syncer builds its requests from pod and pool state, so a request
+		// the API rejects as invalid would be resent verbatim on every retry.
+		// INVALID_ARGUMENT is therefore terminal: the key is dropped and a
+		// future pod event enqueues it again. Every other code — including the
+		// UNAVAILABLE a transport failure surfaces as — requeues.
+		if status.Code(err) == codes.InvalidArgument {
+			slog.ErrorContext(ctx, "Syncer: reconcile rejected as invalid, dropping",
+				append(key.logAttrs(), slog.Any("err", err))...)
+			s.queue.Forget(key)
+			return true
+		}
+		slog.ErrorContext(ctx, "Syncer: reconcile failed, requeueing",
+			append(key.logAttrs(), slog.Any("err", err))...)
+		s.queue.AddRateLimited(key)
+		return true
+	}
+	s.queue.Forget(key)
+	return true
+}
+
+// reconcile converges the registry record for key with the current pod state in
+// the informer cache. Returning an error requeues the key with backoff.
+func (s *WorkerPoolSyncer) reconcile(ctx context.Context, key workerKey) error {
+	obj, exists, err := s.workerInformer.GetIndexer().GetByKey(key.namespace + "/" + key.name)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		slog.InfoContext(ctx, "Syncer: deregistering worker (pod deleted)", key.logAttrs()...)
+		return s.reconcileDeadWorker(ctx, key)
+	}
+	pod := obj.(*corev1.Pod)
+	if string(pod.UID) != key.uid {
+		// The pod was deleted and a new one took its name. This key names the
+		// dead incarnation; the live pod was enqueued under its own key.
+		slog.InfoContext(ctx, "Syncer: deregistering worker (pod replaced)", key.logAttrs()...)
+		return s.reconcileDeadWorker(ctx, key)
+	}
+	if pod.DeletionTimestamp != nil {
+		// The pod has entered Terminating: mark the worker DRAINING so the
+		// scheduler stops routing new actors to it. We deliberately do NOT touch
+		// the bound actor here — inside the pod ateom has received SIGTERM and is
+		// gracefully shutting the actor down. Actor cleanup happens on the Pod
+		// Deleted event.
+		return s.markWorkerDraining(ctx, key)
+	}
+	// A terminal pod is never Ready again, so left alone its Worker would stay
+	// UNAVAILABLE, and the Actors bound to it registered, for as long as the pod
+	// object lingers.
+	if isPodTerminal(pod) {
+		return s.deleteTerminalPod(ctx, key, pod)
+	}
+	return s.createOrUpdateWorker(ctx, key, pod)
+}
+
+// ateomContainer is the name of the worker pod's ateom container.
+const ateomContainer = "ateom"
+
+// podEpoch counts the runs of the pod's ateom container: 1 for its first run
+// and one more for each restart. 0 until kubelet reports the container.
+func podEpoch(pod *corev1.Pod) int64 {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name == ateomContainer {
+			return int64(cs.RestartCount) + 1
+		}
+	}
+	return 0
+}
+
+// createOrUpdateWorker registers the pod's Worker, or brings the registered
+// one in line with the pod. A Worker is registered UNAVAILABLE and marked
+// available only while its pod is Ready, and only once its epoch matches the
+// ateom running, so nothing is placed on it under the epoch of an ateom that
+// has since restarted.
+func (s *WorkerPoolSyncer) createOrUpdateWorker(ctx context.Context, key workerKey, pod *corev1.Pod) error {
+	poolName := pod.Labels[workerPodLabel]
+	poolObject, exists, err := s.workerPoolInformer.GetIndexer().GetByKey(key.namespace + "/" + poolName)
+	if err != nil {
+		return fmt.Errorf("getting WorkerPool %s/%s: %w", key.namespace, poolName, err)
+	}
+	if !exists {
+		return fmt.Errorf("getting WorkerPool %s/%s: not found", key.namespace, poolName)
+	}
+	pool, ok := poolObject.(*atev1alpha1.WorkerPool)
+	if !ok {
+		return fmt.Errorf("getting WorkerPool %s/%s: unexpected object type %T", key.namespace, poolName, poolObject)
+	}
+
+	available := isWorkerAvailable(pod)
+
+	w, err := s.client.GetWorker(ctx, &ateapipb.GetWorkerRequest{Worker: key.workerRef()})
+	if status.Code(err) == codes.NotFound {
+		// ips and node_name are required and immutable, so the pod is registered
+		// once it has an IP; the update that reports it re-enqueues the pod.
+		if len(pod.Status.PodIPs) == 0 {
+			return nil
+		}
+		slog.InfoContext(ctx, "Syncer: registering worker", key.logAttrs()...)
+		worker := &ateapipb.Worker{
+			// Workers are global-scoped, so the name carries no atespace. See
+			// workerKey.workerName for where the name comes from.
+			Metadata:        &ateapipb.ResourceMetadata{Name: key.workerName()},
+			WorkerNamespace: pod.Namespace,
+			WorkerPool:      poolName,
+			WorkerPod:       pod.Name,
+			Ips:             podIPs(pod),
+			WorkerPodUid:    string(pod.UID),
+			NodeName:        pod.Spec.NodeName,
+			SandboxClass:    string(pool.Spec.DefaultSandboxClass()),
+			Labels:          pool.GetLabels(),
+			Epoch:           podEpoch(pod),
+			// Capacity is the Worker's to report, not the syncer's to infer
+			// from the pod: it is what the ateom can actually supply. Until
+			// that report lands, CreateWorker's reified ceiling holds the
+			// Worker to a single Actor.
+		}
+		// status is output-only: CreateWorker registers the Worker UNAVAILABLE.
+		//
+		// ALREADY_EXISTS means we lost a create race; requeue and converge via
+		// the update path. INVALID_ARGUMENT is terminal — see
+		// processNextWorkItem.
+		w, err = s.client.CreateWorker(ctx, &ateapipb.CreateWorkerRequest{Worker: worker})
+		if err != nil {
+			return err
+		}
+	} else if err != nil {
+		return fmt.Errorf("getting worker: %w", err)
+	}
+
+	// Each write below returns the Worker at its new version, which the next
+	// one carries as its precondition. ABORTED requeues the key; the retry
+	// re-fetches the worker.
+	if !available && w.GetStatus().GetState() == ateapipb.WorkerState_WORKER_STATE_ACTIVE {
+		slog.InfoContext(ctx, "Syncer: marking worker unavailable (pod not Ready)", key.logAttrs()...)
+		marked, err := s.client.MarkWorkerUnavailable(ctx, &ateapipb.MarkWorkerUnavailableRequest{Worker: key.workerRef()})
+		if err != nil {
+			return err
+		}
+		w = marked.GetWorker()
+	}
+
+	// UpdateWorker replaces the whole resource, so the mutable fields are
+	// edited onto the Worker as it was read and the rest is sent back unchanged
+	// — anything else altered here, including a field cleared by omission, is
+	// rejected as INVALID_ARGUMENT. Everything else on a Worker is immutable
+	// after create, so drift there cannot be repaired by an update; it takes a
+	// new pod, which arrives under a new key.
+	var changed bool
+	if epoch := podEpoch(pod); epoch > w.GetEpoch() {
+		slog.InfoContext(ctx, "Syncer: updating worker (ateom restarted)",
+			append(key.logAttrs(), slog.Int64("epoch", epoch))...)
+		w.Epoch = epoch
+		changed = true
+	}
+	if !maps.Equal(w.GetLabels(), pool.GetLabels()) {
+		slog.InfoContext(ctx, "Syncer: updating worker (labels changed)", key.logAttrs()...)
+		w.Labels = pool.GetLabels()
+		changed = true
+	}
+	if w.GetSandboxClass() != string(pool.Spec.DefaultSandboxClass()) {
+		// Expected mid-rollout: sandboxClass drives the worker pod's shape, so
+		// editing it on the pool replaces every pod rather than reclassifying
+		// any. This pod predates that edit and is on its way out; its successor
+		// registers under a new key with the new class. Writing the pool's value
+		// back would be rejected, and would misreport this pod's shape to the
+		// scheduler if it were not.
+		slog.DebugContext(ctx, "Syncer: registered worker sandbox class predates its pool",
+			append(key.logAttrs(), slog.String("registered", w.GetSandboxClass()), slog.String("pool", string(pool.Spec.DefaultSandboxClass())))...)
+	}
+	if ips := podIPs(pod); len(ips) > 0 && !slices.Equal(w.GetIps(), ips) {
+		// TODO: I don't think this is possible, but handling this case so we can
+		// log it just in case we can reproduce it. It is logged rather than
+		// repaired because ips is immutable on a registered Worker: writing the
+		// pod's value back would be rejected rather than applied.
+		slog.WarnContext(ctx, "Syncer: registered worker IPs disagree with its pod",
+			append(key.logAttrs(), slog.Any("registered", w.GetIps()), slog.Any("pod_ips", ips))...)
+	}
+	if changed {
+		w, err = s.client.UpdateWorker(ctx, &ateapipb.UpdateWorkerRequest{Worker: w})
+		if err != nil {
+			return err
+		}
+	}
+
+	// Last, so the Worker takes Actors only at the epoch written above. A
+	// DRAINING Worker is left alone: its pod is on its way out.
+	if available && w.GetStatus().GetState() == ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE {
+		slog.InfoContext(ctx, "Syncer: marking worker available (pod Ready)", key.logAttrs()...)
+		_, err = s.client.MarkWorkerAvailable(ctx, &ateapipb.MarkWorkerAvailableRequest{Worker: key.workerRef()})
+		return err
+	}
+	return nil
+}
+
+// isWorkerAvailable reports whether the pod is Ready with an IP, and so can
+// take Actors.
+func isWorkerAvailable(pod *corev1.Pod) bool {
+	if len(pod.Status.PodIPs) == 0 {
+		return false
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+// isPodTerminal reports whether every container in the pod has stopped for
+// good: a terminal phase is never left, so the pod will not serve again.
+func isPodTerminal(pod *corev1.Pod) bool {
+	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
+}
+
+// deleteTerminalPod deletes a worker pod that has reached a terminal phase.
+// The API server deletes a terminal pod without a grace period, and the
+// resulting Pod Deleted event deregisters the Worker and releases its Actors
+// through reconcileDeadWorker. The Worker is marked DRAINING first so the
+// scheduler stops routing to it even while a failed delete is being retried.
+//
+// The delete is preconditioned on the key's UID so it can never remove a
+// same-named replacement. A pod already gone, or replaced, is the state this
+// drives towards, so NotFound and Conflict are success.
+func (s *WorkerPoolSyncer) deleteTerminalPod(ctx context.Context, key workerKey, pod *corev1.Pod) error {
+	if err := s.markWorkerDraining(ctx, key); err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "Syncer: deleting worker pod (terminal phase)",
+		append(key.logAttrs(), slog.String("phase", string(pod.Status.Phase)))...)
+	uid := pod.UID
+	err := s.pods.Pods(key.namespace).Delete(ctx, key.name, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{UID: &uid},
+	})
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("deleting terminal pod: %w", err)
+	}
+	return nil
+}
+
+// podIPs returns the pod's IP addresses, one per IP family, in the order
+// Kubernetes reports them.
+func podIPs(pod *corev1.Pod) []string {
+	ips := make([]string, 0, len(pod.Status.PodIPs))
+	for _, ip := range pod.Status.PodIPs {
+		ips = append(ips, ip.IP)
+	}
+	return ips
+}
+
+// markWorkerDraining transitions a worker to STATE_DRAINING so the scheduler
+// stops routing new actors to it while its pod is Terminating. DrainWorker is
+// idempotent, so a worker already draining costs nothing. If the worker is
+// already gone there is nothing more to do — the Pod Deleted event will clean up
+// the record. A version conflict comes back as ABORTED so the caller requeues
+// and retries against the updated record.
+func (s *WorkerPoolSyncer) markWorkerDraining(ctx context.Context, key workerKey) error {
+	slog.InfoContext(ctx, "Syncer: marking worker draining (pod deleting)", key.logAttrs()...)
+	_, err := s.client.DrainWorker(ctx, &ateapipb.DrainWorkerRequest{Worker: key.workerRef()})
+	if status.Code(err) == codes.NotFound {
+		return nil
+	}
+	return err
+}
+
+// reconcileDeadWorker cleans up a worker whose pod is gone. DeleteWorker
+// releases the bound actor as part of the delete and fails the delete if that
+// release fails, so a failure here leaves the record in place (and returns the
+// error) for a later reconcile to retry.
+//
+// A worker already gone is exactly the state this is driving towards, so
+// NOT_FOUND is success. Idempotency lives here, at the caller, so re-driving a
+// reconcile is safe.
+func (s *WorkerPoolSyncer) reconcileDeadWorker(ctx context.Context, key workerKey) error {
+	_, err := s.client.DeleteWorker(ctx, &ateapipb.DeleteWorkerRequest{Worker: key.workerRef()})
+	if status.Code(err) == codes.NotFound {
+		return nil
+	}
+	return err
+}
+
+// The default retry backoff schedule for a failed page of the startup
+// registered-worker scan.
+const (
+	defaultListBackoff = 500 * time.Millisecond
+	defaultListCap     = 30 * time.Second
+)
+
+// enqueueRegisteredWorkers enqueues a key for every worker record in the
+// registry. Records whose pods are live and unchanged reconcile to a no-op;
+// orphaned records (pod gone, or its name reused by a new pod UID) get cleaned
+// up.
+//
+// Each page's ListWorkers call is retried with capped backoff until it succeeds
+// or ctx is cancelled, so a transient failure does not abandon the scan and
+// leave ghost workers behind until the next restart (the per-key workqueue
+// retries reconciles, but nothing retries this initial enqueue scan). Pages are
+// enqueued as they are read, so the whole worker set is never held in memory at
+// once and a late failure does not re-scan the pages already enqueued.
+func (s *WorkerPoolSyncer) enqueueRegisteredWorkers(ctx context.Context) {
+	var pageToken string
+	for {
+		page, err := s.listWorkersPageWithRetry(ctx, pageToken)
+		if err != nil {
+			// Only ctx cancellation (ate-controller shutdown) ends the retry
+			// loop. Pages read so far are already enqueued (partial progress);
+			// the rest are recovered by the next startup scan.
+			slog.ErrorContext(ctx, "Syncer: stopped enqueue of registered workers before completing the scan; remaining workers will be retried at the next startup", slog.Any("err", err))
+			return
+		}
+		for _, w := range page.GetWorkers() {
+			// The key is a pod identity, so it is rebuilt from the recorded pod
+			// fields rather than from the Worker's name.
+			s.queue.Add(workerKey{
+				namespace: w.GetWorkerNamespace(),
+				name:      w.GetWorkerPod(),
+				uid:       w.GetWorkerPodUid(),
+			})
+		}
+		if page.GetNextPageToken() == "" {
+			return
+		}
+		pageToken = page.GetNextPageToken()
+	}
+}
+
+// listWorkersPageWithRetry reads one page of workers, retrying the call with
+// capped exponential backoff until it succeeds or ctx is cancelled. The page
+// token is a stateless cursor, so retrying the failed call with the same token
+// resumes from the same position. A fresh backoff per page means only
+// consecutive failures of the same call accumulate delay; a page that succeeds
+// resets it.
+func (s *WorkerPoolSyncer) listWorkersPageWithRetry(ctx context.Context, pageToken string) (*ateapipb.ListWorkersResponse, error) {
+	backoff := wait.Backoff{
+		Duration: s.listBackoff,
+		Factor:   2.0,
+		Jitter:   0.1,
+		// Steps must be large enough for the ramp (Duration*Factor^n) to reach
+		// Cap, or Cap never triggers and the plateau sits at the last ramp step.
+		// With Duration=500ms, Factor=2, the ramp hits Cap=30s at step 6
+		// (0.5,1,2,4,8,16,30,30...).
+		Steps: 6,
+		Cap:   s.listCap,
+	}
+	for {
+		page, err := s.client.ListWorkers(ctx, &ateapipb.ListWorkersRequest{Options: &ateapipb.ListOptions{PageSize: 1000, PageToken: pageToken}})
+		if err == nil {
+			return page, nil
+		}
+		slog.WarnContext(ctx, "Syncer: failed to list a page of registered workers for orphan cleanup, retrying", slog.Any("err", err))
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("listing registered workers aborted: %w", ctx.Err())
+		case <-time.After(backoff.Step()):
+		}
+	}
+}

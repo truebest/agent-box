@@ -1,0 +1,119 @@
+title = "Agent Box secret detection"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "devin-api-key"
+description = "Devin / Cognition API credential"
+regex = '''\bcog_[A-Za-z0-9_-]{20,}\b'''
+keywords = ["cog_"]
+
+# Exact values in unchanged, public upstream test fixtures and documentation.
+# Do not allowlist directories: a different credential in these files must fail.
+
+[[allowlists]]
+description = "Public upstream fixture: vendor/substrate/.agents/skills/review-crds/references/api-conventions.md"
+targetRules = ["curl-auth-header"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''(?:^|/)vendor/substrate/\.agents/skills/review\-crds/references/api\-conventions\.md$''']
+regexes = [
+  '''^WhCDvq4VPpYhrcfmF6ei7V9qlbqTubUc$''',
+]
+
+[[allowlists]]
+description = "Public upstream fixture: vendor/substrate/docs/egress-credential-injection.md"
+targetRules = ["curl-auth-header"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''(?:^|/)vendor/substrate/docs/egress\-credential\-injection\.md$''']
+regexes = [
+  '''^placeholder$''',
+]
+
+[[allowlists]]
+description = "Public upstream fixture: vendor/herdr-web-ui/server/voice.test.ts"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''(?:^|/)vendor/herdr\-web\-ui/server/voice\.test\.ts$''']
+regexes = [
+  '''^sk\-test\-0123456789abcdef$''',
+]
+
+[[allowlists]]
+description = "Public upstream fixture: vendor/substrate/cmd/ateapi/internal/apiauthn/apiauthn_test.go"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''(?:^|/)vendor/substrate/cmd/ateapi/internal/apiauthn/apiauthn_test\.go$''']
+regexes = [
+  '''^e30\.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIn0\.YmFk$''',
+  '''^e30\.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIn0\.Z29vZA$''',
+]
+
+[[allowlists]]
+description = "Public upstream fixture: vendor/substrate/cmd/ateapi/internal/apivalidation/worker_test.go"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''(?:^|/)vendor/substrate/cmd/ateapi/internal/apivalidation/worker_test\.go$''']
+regexes = [
+  '''^1a7e4c83\-6d20\-4f95\-b3c8\-9e0a2f6d4b17$''',
+  '''^5f2c1a90\-7b34\-4e6d\-8a11\-0c3e9d5b7f42$''',
+]
+
+[[allowlists]]
+description = "Public upstream fixture: vendor/substrate/cmd/ateapi/internal/controlapi/worker_test.go"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''(?:^|/)vendor/substrate/cmd/ateapi/internal/controlapi/worker_test\.go$''']
+regexes = [
+  '''^1a7e4c83\-6d20\-4f95\-b3c8\-9e0a2f6d4b17$''',
+  '''^5f2c1a90\-7b34\-4e6d\-8a11\-0c3e9d5b7f42$''',
+]
+
+[[allowlists]]
+description = "Public upstream fixture: vendor/substrate/vendor/cloud.google.com/go/CONTRIBUTING.md"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''(?:^|/)vendor/substrate/vendor/cloud\.google\.com/go/CONTRIBUTING\.md$''']
+regexes = [
+  '''^abcdefghijk123456789$''',
+]
+
+[[allowlists]]
+description = "Public upstream fixture: vendor/substrate/vendor/cloud.google.com/go/storage/storage.replay"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''(?:^|/)vendor/substrate/vendor/cloud\.google\.com/go/storage/storage\.replay$''']
+regexes = [
+  '''^ChBvYmovd2l0aC9zbGFzaGVz$''',
+  '''^FnBvfQ1dDsyS8kHD\+aB6HHIglDoQ5Im7WYDm3XYTGrQ=$''',
+  '''^H\+LmnXhRoeI6TMW5bsV6HyUk6pyGc2IMbqYbAXBcps0=$''',
+  '''^Io4lnOPU\+EThO0X0nq7mNEXB1rWxZsBI4L37pBmyfDc=$''',
+]
+
+[[allowlists]]
+description = "Public upstream fixture: vendor/substrate/internal/ateinterceptors/ateinterceptors_test.go"
+targetRules = ["jwt", "generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''(?:^|/)vendor/substrate/internal/ateinterceptors/ateinterceptors_test\.go$''']
+regexes = [
+  '''^eyJhbGciOiJSUzI1NiJ9\.eyJzdWIiOiJhY3RvciJ9\.c2lnbmF0dXJl$''',
+]
+
+[[allowlists]]
+description = "Public upstream fixture: vendor/substrate/internal/contextlogging/contextlogging_test.go"
+targetRules = ["jwt", "generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''(?:^|/)vendor/substrate/internal/contextlogging/contextlogging_test\.go$''']
+regexes = [
+  '''^eyJhbGciOiJSUzI1NiJ9\.eyJzdWIiOiJhY3RvciJ9\.c2lnbmF0dXJl$''',
+]

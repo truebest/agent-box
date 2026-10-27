@@ -1,0 +1,88 @@
+@import "tailwindcss";
+@plugin "daisyui" {
+  themes: light --default, dark --prefersdark, cupcake, synthwave;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+}
+
+.notifications {
+  position: fixed;
+  top: max(1rem, env(safe-area-inset-top));
+  right: max(1rem, env(safe-area-inset-right));
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: min(24rem, calc(100vw - 2rem));
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
+  pointer-events: none;
+}
+
+.custom-scrollbar:has(> .superterminal-page) {
+  display: flex;
+  flex-direction: column;
+}
+
+.superterminal-surface {
+  position: relative;
+}
+
+.superterminal-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.superterminal-surface:has(> iframe[data-ready]) > .superterminal-loading {
+  display: none;
+}
+
+.superterminal-frame {
+  display: block;
+  background: inherit;
+  color-scheme: inherit;
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.superterminal-frame[data-ready] {
+  visibility: visible;
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .superterminal-frame { transition: none; }
+  .loading { animation: none; }
+}
+
+::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+}
+
+
+::-webkit-scrollbar-track {
+    background-color: transparent;
+}
+
+::-webkit-scrollbar-button {
+    display: none;
+    width: 0;
+    height: 0;
+}
+
+.xterm-viewport{
+    background: transparent!important;
+}

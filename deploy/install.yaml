@@ -1,0 +1,22 @@
+apiVersion: install.ate.dev/v1alpha1
+kind: SubstrateInstall
+namespace: ate-system
+context: kind-agent-sandbox-demo
+kindCluster:
+  enabled: true
+  name: agent-sandbox-demo
+images:
+  repo: localhost:5001/substrate
+  tag: v0.5.0
+rolloutTimeout: 5m0s
+storage:
+  bucketName: ate-snapshots
+actorJWT:
+  issuer: https://substrate.agent-box-host.local
+ateapi:
+  postgres:
+    storageClass: agent-thin
+atenet:
+  dataplane: envoy
+  egress:
+    credentialProvider: '{"enabled":false}'

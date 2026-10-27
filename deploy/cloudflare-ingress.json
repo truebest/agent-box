@@ -1,0 +1,23 @@
+{
+  "config": {
+    "ingress": [
+      {
+        "hostname": "agents.example.com",
+        "service": "https://192.0.2.10:8443",
+        "originRequest": {
+          "originServerName": "192.0.2.10",
+          "caPool": "/etc/agent-box-ca/ca.crt",
+          "noTLSVerify": false,
+          "access": {
+            "required": true,
+            "teamName": "example",
+            "audTag": [
+              "0000000000000000000000000000000000000000000000000000000000000000"
+            ]
+          }
+        }
+      },
+      {"service": "http_status:404"}
+    ]
+  }
+}

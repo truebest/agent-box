@@ -1,0 +1,81 @@
+--- a/internal/objectstoreplugin/node.go
++++ b/internal/objectstoreplugin/node.go
+@@ -49,6 +49,8 @@
+ 	gcsClient objectstorage.ObjectStorage
+ 	// root confines every local path a caller names.
+ 	root string
++
++	SnapshotArchive bool
+ }
+ 
+ // NewNodePlugin returns a NodePlugin that reads and writes local files only
+@@ -71,6 +73,16 @@
+ 		return nil, toStatus(fmt.Errorf("while opening restore directory: %w", err))
+ 	}
+ 	defer root.Close()
++
++	if p.SnapshotArchive {
++		found, err := p.fetchArchive(ctx, uri, root, req.GetFiles())
++		if found || err != nil {
++			if err != nil {
++				return nil, toStatus(err)
++			}
++			return &objectstorev1.FetchSnapshotResponse{}, nil
++		}
++	}
+ 
+ 	g, gCtx := errgroup.WithContext(ctx)
+ 	for _, fileName := range req.GetFiles() {
+@@ -119,6 +131,13 @@
+ 	}
+ 	defer root.Close()
+ 
++	if p.SnapshotArchive {
++		if err := p.uploadArchive(ctx, uri, root, req.GetFiles()); err != nil {
++			return nil, toStatus(err)
++		}
++		return &objectstorev1.UploadSnapshotResponse{}, nil
++	}
++
+ 	g, gCtx := errgroup.WithContext(ctx)
+ 	for _, fileName := range req.GetFiles() {
+ 		g.Go(func() error {
+--- a/cmd/objectstore-plugin/main.go
++++ b/cmd/objectstore-plugin/main.go
+@@ -97,6 +97,7 @@
+ 		if err != nil {
+ 			serverboot.Fatal(ctx, "Invalid --root", err)
+ 		}
++		plugin.SnapshotArchive = os.Getenv("ATE_SNAPSHOT_ARCHIVE") == "tar.zst"
+ 		objectstorev1.RegisterNodeProviderServer(srv, plugin)
+ 		capacity, err := parseCapacity(*assetStagingCapacity)
+ 		if err != nil {
+--- a/cmd/atelet/main.go
++++ b/cmd/atelet/main.go
+@@ -745,7 +745,7 @@
+ 	}
+ 
+ 	tAteom := time.Now()
+-	resp, err := client.CheckpointWorkload(ctx, &ateompb.CheckpointWorkloadRequest{
++	resp, err := checkpointWithPreparedResult(ctx, req, checkpointDir, client, &ateompb.CheckpointWorkloadRequest{
+ 		Atespace:              actorRef.Atespace,
+ 		ActorName:             actorRef.Name,
+ 		ActorTemplateAtespace: req.GetActorTemplateAtespace(),
+@@ -961,6 +961,17 @@
+ 			return fmt.Errorf("while inspecting %s in snapshot directory: %w", fileName, err)
+ 		}
+ 		recordSnapshotSize(ctx, fileName, allocatedBytes(info), templateAtespace, templateName)
++	}
++	if os.Getenv("ATE_SNAPSHOT_ARCHIVE") == "tar.zst" {
++		manifest, err := json.Marshal(rec)
++		if err != nil {
++			return err
++		}
++		if err := root.WriteFile(sandboxManifestName, manifest, 0o600); err != nil {
++			return err
++		}
++		files := append([]string{sandboxManifestName}, rec.SnapshotFiles...)
++		return s.uploadSnapshotFiles(ctx, uri.String(), srcDir, files, opts...)
+ 	}
+ 	if err := s.uploadSnapshotFiles(ctx, uri.String(), srcDir, rec.SnapshotFiles, opts...); err != nil {
+ 		return fmt.Errorf("while uploading snapshot files: %w", err)

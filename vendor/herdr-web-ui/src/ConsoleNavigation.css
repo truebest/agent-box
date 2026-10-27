@@ -1,0 +1,126 @@
+.console-host-list {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-2) 0;
+}
+
+.console-workers {
+  padding: var(--space-2) var(--side-gutter);
+}
+
+.console-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-height: var(--side-row);
+  padding-left: var(--side-box);
+}
+
+.console-section-head h2 {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+}
+
+.console-all-workers {
+  padding: var(--space-1);
+  font-size: var(--fs-xs);
+}
+
+.console-worker {
+  display: flex;
+  align-items: flex-start;
+  width: 100%;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-1);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.console-worker:hover { background: var(--side-hover); }
+.console-worker[aria-pressed="true"] { background: var(--side-selected); }
+.console-worker:focus-visible { outline-offset: calc(var(--ring-offset) * -1); }
+.console-worker-name { overflow-wrap: anywhere; font-size: var(--fs-sm); }
+
+.console-sandboxes {
+  padding: 0 var(--side-gutter) var(--space-3);
+}
+
+.console-sandbox { padding: var(--space-2) var(--space-1); }
+.console-agent-status {
+  --console-status-red: #dc2626;
+  --console-status-yellow: #a77b00;
+  --console-status-green: #15803d;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 var(--side-box);
+  width: var(--side-box);
+  height: var(--chip-h);
+  color: var(--console-status-red);
+}
+[data-theme="dark"] .console-agent-status {
+  --console-status-red: #ef4444;
+  --console-status-yellow: #facc15;
+  --console-status-green: #4ade80;
+}
+.console-agent-status:is([data-status="working"], [data-status="waiting"]) { color: var(--console-status-yellow); }
+.console-agent-status:is([data-status="idle"], [data-status="done"]) { color: var(--console-status-green); }
+.console-agent-status .sidebar-status-dot {
+  width: var(--space-3);
+  height: var(--space-3);
+}
+.console-placeholder { align-items: center; gap: var(--space-3); pointer-events: auto; }
+
+.console-session {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+}
+
+.console-session-frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: inherit;
+  color-scheme: inherit;
+  visibility: hidden;
+}
+
+.console-session-frame[data-ready] { visibility: visible; }
+.console-session:has(> iframe[data-ready]) > .terminal-placeholder { display: none; }
+[data-console-session] .app-body > .sidebar,
+[data-console-session] .app-body > .scrim { display: none; }
+
+@media (min-width: 769px) {
+  [data-console-session] .app:not(.sidebar-collapsed) .app-header.is-zoned { padding-left: var(--space-3); }
+  [data-console-session] .app:not(.sidebar-collapsed) .header-side { display: contents; }
+}
+
+[data-console-wide="true"] .drawer-toggle { display: none; }
+[data-console-wide="true"] .sidebar-toggle { display: inline-flex; }
+[data-console-wide="false"] .drawer-toggle { display: inline-flex; }
+[data-console-wide="false"] .sidebar-toggle { display: none; }
+
+.console-worker-sandboxes,
+.console-sandbox-contents { padding-left: var(--space-4); }
+.console-sandbox-header { display: flex; align-items: center; border-radius: var(--radius-md); }
+.console-sandbox-header.is-selected { background: var(--side-selected); }
+.console-sandbox-header .console-sandbox { flex: 1; min-width: 0; }
+.console-sandbox-branch { min-width: 0; }
+.console-agent { width: 100%; padding: var(--space-2) var(--space-1); }
+.console-roster-error { margin: var(--space-2) 0 var(--space-2) var(--side-box); color: var(--text-dim); font-size: var(--fs-xs); }
+.console-roster-error p { margin: 0; }
+.console-pane-error { position: absolute; top: var(--space-2); left: var(--space-2); right: var(--space-2); z-index: 4; background: var(--bg-panel); }
