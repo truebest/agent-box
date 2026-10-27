@@ -12,6 +12,9 @@ import tarfile
 import time
 import urllib.request
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from configuration import load, require_context
+
 
 def configure_session_storage(deployment, claim="panel-sessions"):
     deployment["spec"]["strategy"] = {"type": "Recreate"}
@@ -24,14 +27,15 @@ def configure_session_storage(deployment, claim="panel-sessions"):
 
 
 def ensure_session_claim(name="panel-sessions"):
+    storage_class = load()["storage_class"]
     current = sp.check_output(["kubectl", "-n", "pvm-agents", "get", "pvc", name, "--ignore-not-found", "-o", "json"])
     if current.strip():
         spec = json.loads(current)["spec"]
-        if spec.get("storageClassName") != "agent-thin" or spec.get("accessModes") != ["ReadWriteOnce"]:
+        if spec.get("storageClassName") != storage_class or spec.get("accessModes") != ["ReadWriteOnce"]:
             raise RuntimeError("Unexpected panel session volume configuration")
         return
     claim = {"apiVersion": "v1", "kind": "PersistentVolumeClaim", "metadata": {"name": name, "namespace": "pvm-agents"},
-             "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": "agent-thin", "resources": {"requests": {"storage": "1Gi"}}}}
+             "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": storage_class, "resources": {"requests": {"storage": "1Gi"}}}}
     sp.run(["kubectl", "create", "-f", "-"], input=json.dumps(claim).encode(), check=True)
 
 
@@ -51,7 +55,7 @@ def artifact(directory, component="panel"):
 def ensure_sandbox_template(image, name="sandbox-v1"):
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,48}[a-z0-9]", name):
         raise ValueError("Invalid sandbox template name")
-    ate = "/home/operator/substrate-agent-box-host/vendor/substrate/bin/kubectl-ate"
+    ate = str(Path(load()["repository"]) / "vendor/substrate/bin/kubectl-ate")
     command = [ate, "get", "actor-template"]
     catalog = sp.check_output(["kubectl", "-n", "pvm-agents", "get", "configmap", "worker-profiles", "--ignore-not-found", "-o", "json"])
     if catalog.strip():
@@ -75,20 +79,21 @@ def ensure_sandbox_template(image, name="sandbox-v1"):
 
 
 def publish_runtime(directory, revision):
+    config = load()
     runtime_revision, image_id, archive = artifact(directory, "runtime")
     assert runtime_revision == revision
     sp.check_output(["docker", "load", "-i", str(archive)])
     source = "agent-box-host-runtime:" + revision
     verify_loaded_image(source, image_id)
-    tag = "localhost:5001/agents/native:ci-" + revision
+    tag = config["registry_address"] + "/agents/native:ci-" + revision
     sp.check_output(["docker", "tag", source, tag])
     sp.check_output(["docker", "push", tag])
-    request = urllib.request.Request("http://127.0.0.1:5001/v2/agents/native/manifests/ci-" + revision,
+    request = urllib.request.Request(config["registry_url"] + "/v2/agents/native/manifests/ci-" + revision,
         headers={"Accept": "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"})
     with urllib.request.urlopen(request) as response:
         digest = response.headers["Docker-Content-Digest"]
     assert re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
-    image = "localhost:5001/agents/native@" + digest
+    image = config["registry_address"] + "/agents/native@" + digest
     name = ensure_sandbox_template(image, "sandbox-v1-" + digest.removeprefix("sha256:")[:12])
     return {"template": name, "image": image}
 
@@ -116,6 +121,7 @@ def verify_loaded_image(source, image_id):
 
 
 def publish_workers(directory, revision, live):
+    config = load()
     release = json.loads((live / "images.json").read_text())
     previous = sp.check_output(["kubectl", "-n", "ate-system", "get", "deployment", "ate-controller", "-o", "json"])
     (directory / "previous-controller.json").write_bytes(previous)
@@ -126,16 +132,16 @@ def publish_workers(directory, revision, live):
         sp.check_output(["docker", "load", "-i", str(archive)])
         source = "agent-box-host-" + component + ":" + revision
         verify_loaded_image(source, image_id)
-        tag = "localhost:5001/substrate/" + binary + ":ci-" + revision
+        tag = config["registry_address"] + "/substrate/" + binary + ":ci-" + revision
         sp.check_output(["docker", "tag", source, tag])
         sp.check_output(["docker", "push", tag])
-        request = urllib.request.Request("http://127.0.0.1:5001/v2/substrate/" + binary + "/manifests/ci-" + revision,
+        request = urllib.request.Request(config["registry_url"] + "/v2/substrate/" + binary + "/manifests/ci-" + revision,
             headers={"Accept": "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"})
         with urllib.request.urlopen(request) as response:
             digest = response.headers["Docker-Content-Digest"]
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
             raise ValueError("Invalid registry digest")
-        release[component] = "localhost:5001/substrate/" + binary + "@" + digest
+        release[component] = config["registry_address"] + "/substrate/" + binary + "@" + digest
     sp.check_output(["kubectl", "apply", "--server-side", "--field-manager=ate-setup", "-f", str(directory / "ate.dev_workerpools.yaml")])
     sp.check_output(["kubectl", "apply", "-f", str(directory / "worker-profiles-rbac.yaml")])
     controller = json.loads(previous)
@@ -165,22 +171,24 @@ def refresh_worker_sources(live, sandbox):
 
 
 def main(directory):
+    config = load()
     os.umask(0o077)
     revision, image_id, archive = artifact(directory)
-    live = Path("/home/operator/substrate-agent-box-host")
+    require_context(config)
+    live = Path(config["repository"])
     run = sp.check_output
     run(["docker", "load", "-i", str(archive)])
     source = "agent-box-host-panel:" + revision
     verify_loaded_image(source, image_id)
-    tag = "localhost:5001/panel:ci-" + revision
+    tag = config["registry_address"] + "/panel:ci-" + revision
     run(["docker", "tag", source, tag])
     run(["docker", "push", tag])
-    request = urllib.request.Request("http://127.0.0.1:5001/v2/panel/manifests/ci-" + revision,
+    request = urllib.request.Request(config["registry_url"] + "/v2/panel/manifests/ci-" + revision,
         headers={"Accept": "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"})
     with urllib.request.urlopen(request) as response:
         digest = response.headers["Docker-Content-Digest"]
     assert re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
-    image = "localhost:5001/panel@" + digest
+    image = config["registry_address"] + "/panel@" + digest
     command = ["kubectl", "-n", "pvm-agents"]
     previous = json.loads(run(command + ["get", "deployment", "panel", "-o", "json"]))
     assert previous["spec"]["template"]["spec"]["containers"][0]["name"] == "panel"
@@ -199,6 +207,7 @@ def main(directory):
         container["env"].append({"name": "SANDBOX_TEMPLATE", "value": sandbox["template"]})
 
     lifecycle_previous = None
+    configuration_previous = None
     if (directory / "controller.tar.gz").exists():
         catalog = run(command + ["get", "configmap", "worker-profiles", "--ignore-not-found", "-o", "json"])
         if catalog.strip():
@@ -211,6 +220,13 @@ def main(directory):
             lifecycle = live / "deploy/host-lifecycle.py"
             lifecycle_previous = lifecycle.read_bytes()
             (directory / "previous-host-lifecycle.py").write_bytes(lifecycle_previous)
+            configuration_module = live / "deploy/configuration.py"
+            if configuration_module.exists():
+                configuration_previous = configuration_module.read_bytes()
+                (directory / "previous-configuration.py").write_bytes(configuration_previous)
+            pending_configuration = configuration_module.with_suffix(".py.tmp")
+            pending_configuration.write_bytes((directory / "configuration.py").read_bytes())
+            os.replace(pending_configuration, configuration_module)
             lifecycle.write_bytes((directory / "host-lifecycle.py").read_bytes())
 
     def service(action):
@@ -259,6 +275,10 @@ def main(directory):
         except BaseException:
             if lifecycle_previous is not None:
                 lifecycle.write_bytes(lifecycle_previous)
+                if configuration_previous is None:
+                    configuration_module.unlink()
+                else:
+                    configuration_module.write_bytes(configuration_previous)
             replace(image, old_image, previous)
             raise
     finally:

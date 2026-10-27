@@ -10,6 +10,7 @@ import subprocess as sp
 import urllib.parse
 import urllib.request
 import uuid
+from configuration import load, require_context
 
 root = Path(__file__).resolve().parents[1]
 ate = str(root / "vendor/substrate/bin/kubectl-ate")
@@ -77,10 +78,11 @@ aws s3api list-objects-v2 --bucket agent-box-snapshots --prefix {key} >/dev/null
 
 
 def digest(component):
-    request = urllib.request.Request(f"http://127.0.0.1:5001/v2/substrate/{component}/manifests/r2-archive-v1",
+    installation = load()
+    request = urllib.request.Request(f"{installation['registry_url']}/v2/substrate/{component}/manifests/r2-archive-v1",
                                      headers={"Accept": "application/vnd.oci.image.index.v1+json"})
     with urllib.request.urlopen(request) as response:
-        return f"localhost:5001/substrate/{component}@{response.headers['Docker-Content-Digest']}"
+        return f"{installation['registry_address']}/substrate/{component}@{response.headers['Docker-Content-Digest']}"
 
 
 def template(name):
@@ -88,6 +90,13 @@ def template(name):
     value["metadata"] = {"atespace": "pvm-agents", "name": name}
     value.pop("status", None)
     return value
+
+
+def storage_templates(images):
+    names = {"pi", "codex"}
+    if images.get("sandbox"):
+        names.add(images["sandbox"]["template"])
+    return {name: template(name) for name in sorted(names)}
 
 
 def forward(action):
@@ -107,6 +116,9 @@ def patch_workload(kind, name, pod):
 
 
 def main():
+    require_context(load())
+    if run("kubectl", "-n", "pvm-agents", "get", "configmap", "worker-profiles", "--ignore-not-found", "-o", "name").strip():
+        raise RuntimeError("Configure snapshot storage before bootstrapping Worker profiles")
     os.umask(0o077)
     config, credentials = settings(Path.home() / ".config/substrate-r2")
     pins = {name: digest(name) for name in ("atelet", "objectstore-plugin")}
@@ -116,7 +128,8 @@ def main():
                        for k, v in (("access-key", "access_key_id"), ("secret-key", "secret_access_key"))}}
     run("kubectl", "apply", "-f", "-", data=secret)
     smoke_test(config)
-    old_templates = {kind: template(kind) for kind in ("pi", "codex")}
+    images = json.loads((root / "images.json").read_text())
+    old_templates = storage_templates(images)
     old_workloads = {(kind, name): json.loads(run("kubectl", "-n", "ate-system", "get", kind, name, "-o", "json"))["spec"]["template"]
                      for kind, name in (("daemonset", "atelet"), ("deployment", "ate-api-server"))}
     backup = root / "archives" / ("before-r2-" + datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
@@ -124,7 +137,6 @@ def main():
     (backup / "templates.json").write_text(json.dumps(old_templates, indent=2) + "\n")
     for (_, name), pod in old_workloads.items():
         (backup / (name + ".json")).write_text(json.dumps(pod, indent=2) + "\n")
-    images = json.loads((root / "images.json").read_text())
     (backup / "images.json").write_text(json.dumps(images, indent=2) + "\n")
     changed = []
     forward("stop")
@@ -160,7 +172,7 @@ def main():
     finally:
         forward("start")
     report = {"config": config, "images": pins, "rollback": str(backup), "s3_round_trip": True}
-    (root / "evidence/r2-deploy.json").write_text(json.dumps(report, indent=2) + "\n")
+    (backup / "result.json").write_text(json.dumps(report, indent=2) + "\n")
     print("R2 connected; rollback configuration:", backup, flush=True)
 
 

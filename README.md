@@ -11,6 +11,8 @@ Current agent integrations are Codex, Pi and Devin CLI.
 For everyday use, start with the [user guide](docs/README.md).
 For installation, see [deployment](docs/DEPLOYMENT.md).
 
+![Agent Box sandbox list with demonstration data](docs/images/sandboxes.png)
+
 ## How it works
 
 ```mermaid
@@ -130,7 +132,9 @@ npm run build
 ```
 
 GitHub Actions runs secret scanning, Python tests, frontend tests, lint and the
-frontend build. Run browser and integration tests against disposable sandboxes.
+frontend build. To regenerate the README screenshot after building the frontend,
+run `node tests/readme-screenshot.cjs` with Playwright and Chromium installed.
+It uses demonstration data. Run browser and integration tests against disposable sandboxes.
 
 ## Connect to an installation
 

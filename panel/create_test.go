@@ -98,6 +98,15 @@ func createHTTP(s *server, body string, stream bool) *httptest.ResponseRecorder 
 	return w
 }
 
+func TestEmptySandboxCreationNeedsNoProviderCredentials(t *testing.T) {
+	s, api, prompts := createServer(t, nil, true)
+	s.authFile = filepath.Join(t.TempDir(), "no-provider-credentials")
+	w := createHTTP(s, `{"name":"empty-workspace","kind":"none"}`, false)
+	if w.Code != http.StatusOK || api.creates != 1 || *prompts != 0 {
+		t.Fatalf("empty workspace required provider credentials: HTTP %d %s", w.Code, w.Body.String())
+	}
+}
+
 func TestCreateStreamsRealStagesAndNeverReplaysPrompt(t *testing.T) {
 	s, api, prompts := createServer(t, nil, true)
 	body := `{"name":"test-create","kind":"codex","prompt":"private initial task"}`

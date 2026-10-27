@@ -232,8 +232,8 @@ func (s *server) inject(ctx context.Context, name string, hint ...string) error 
 	}
 	// A restored sandbox retains its agent settings inside its private HOME.
 	// Inspect them before reading or delivering another provider's credentials.
-	needsCodex := kind != "devin"
-	if kind == "" || kind == "devin" {
+	needsCodex := kind != "devin" && kind != "none"
+	if kind == "" || kind == "devin" || kind == "none" {
 		response, err := s.workload(ctx, name, "GET", "/session", nil)
 		if err != nil {
 			return errors.New("Cannot determine the restored agent; open Terminal before retrying")
@@ -251,7 +251,7 @@ func (s *server) inject(ctx context.Context, name string, hint ...string) error 
 		if kind == "" {
 			kind = session.Kind
 		}
-		needsCodex = kind != "devin"
+		needsCodex = kind != "devin" && kind != "none"
 		for _, runner := range session.Agents {
 			if runner.Agent == "codex" || runner.Agent == "pi" {
 				needsCodex = true

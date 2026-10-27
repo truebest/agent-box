@@ -11,6 +11,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deploy"))
+
 
 
 class WorkerDeployTests(unittest.TestCase):
@@ -94,7 +97,7 @@ class WorkerDeployTests(unittest.TestCase):
         for exists in (False, True):
             with self.subTest(exists=exists):
                 run = Mock()
-                namespace = {"sp": types.SimpleNamespace(run=Mock(return_value=types.SimpleNamespace(returncode=0 if exists else 1))), "run": run}
+                namespace = {"sp": types.SimpleNamespace(run=Mock(return_value=types.SimpleNamespace(returncode=0 if exists else 1))), "run": run, "re": __import__("re")}
                 exec(compile(ast.Module(body=[helper], type_ignores=[]), "deploy_worker_pool", "exec"), namespace)
                 result = namespace["deploy_worker_pool"]((ROOT / "deploy/agents.yaml").read_text())
                 calls = run.call_args_list
@@ -126,7 +129,8 @@ class WorkerDeployTests(unittest.TestCase):
             staged.append(json.loads(kwargs['input']))
             raise Applied
         response = types.SimpleNamespace(headers={"Docker-Content-Digest": "sha256:candidate"})
-        with patch("urllib.request.urlopen", return_value=contextlib.nullcontext(response)), \
+        with patch("configuration.load", return_value={"storage_class": "standard"}), \
+                patch("urllib.request.urlopen", return_value=contextlib.nullcontext(response)), \
                 patch("subprocess.check_output", side_effect=lambda args, **kwargs: b'' if 'pvc' in args or 'configmap' in args else json.dumps(deployment).encode()), \
                 patch("subprocess.run", side_effect=apply), self.assertRaises(Applied):
             runpy.run_path(str(ROOT / "deploy/stage-console.py"))

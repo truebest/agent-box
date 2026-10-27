@@ -8,8 +8,9 @@ import runpy
 import subprocess
 import time
 import urllib.request
+from configuration import load, require_context
 
-ROOT = Path('/home/operator/substrate-agent-box-host')
+ROOT = Path(__file__).resolve().parents[1]
 ATE = ROOT/'vendor/substrate/bin/kubectl-ate'
 
 
@@ -26,19 +27,25 @@ def identities():
 
 
 def published(repository, revision):
-    req = urllib.request.Request('http://127.0.0.1:5001/v2/'+repository+'/manifests/ci-'+revision,
+    config = load()
+    req = urllib.request.Request(config['registry_url']+'/v2/'+repository+'/manifests/ci-'+revision,
         headers={'Accept':'application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'})
     with urllib.request.urlopen(req) as response:
         digest=response.headers['Docker-Content-Digest']
     if not re.fullmatch(r'sha256:[a-f0-9]{64}',digest):
         raise ValueError('Invalid published image digest')
-    return 'localhost:5001/'+repository+'@'+digest
+    return config['registry_address']+'/'+repository+'@'+digest
 
 
 def main(release):
+    global ROOT, ATE
+    config = load()
+    require_context(config)
+    ROOT = Path(config["repository"])
+    ATE = ROOT / "vendor/substrate/bin/kubectl-ate"
     os.umask(0o077)
     release=release.resolve()
-    if release.parent!=Path('/home/operator/substrate-releases'):
+    if release.parent != ROOT / 'archives/releases':
         raise ValueError('Use a verified release directory')
     revision=(release/'revision.txt').read_text().strip()
     if not re.fullmatch(r'[a-f0-9]{40}',revision):

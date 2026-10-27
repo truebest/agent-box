@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import subprocess
 import sys
 import time
@@ -14,6 +15,8 @@ from urllib.parse import quote
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from agent import Client
+sys.path.insert(0, str(ROOT / "deploy"))
+from configuration import load, require_context
 
 ATE = str(ROOT / "vendor/substrate/bin/kubectl-ate")
 SPACE = "pvm-agents"
@@ -43,8 +46,8 @@ def compatible(template):
             and template.get("workerSelector") == {"matchLabels": {"workload": SPACE}})
 
 
-def catalog(base, old_templates, node, worker_image, candidate_id=None):
-    if not re.fullmatch(r"localhost:5001/substrate/ateom-gvisor@sha256:[0-9a-f]{64}", worker_image):
+def catalog(base, old_templates, node, worker_image, candidate_id=None, *, capacity):
+    if not re.fullmatch(r"localhost:[0-9]{1,5}/substrate/ateom-gvisor@sha256:[0-9a-f]{64}", worker_image):
         raise ValueError("A verified Worker digest is required")
     if not compatible(base):
         raise ValueError("Base template is not compatible with Standard v1")
@@ -62,7 +65,10 @@ def catalog(base, old_templates, node, worker_image, candidate_id=None):
         for old in old_templates:
             if compatible(old):
                 bindings[old["metadata"]["name"]] = {"profile_id": profile_id, "revision": 1}
-    revision = {"revision": 1, "cpu_milli": 8000, "memory_mib": 8256, "slots": 4, "reserved_memory_mib": 64, "reserved_cpu_milli": 0,
+    slots = min(capacity["cpu_milli"] // 2000, (capacity["memory_mib"] - 64) // 2048)
+    if slots < 1:
+        raise ValueError("Worker capacity cannot fit a 2 CPU, 2 GiB sandbox and its service reserve")
+    revision = {"revision": 1, "cpu_milli": slots * 2000, "memory_mib": slots * 2048 + 64, "slots": slots, "reserved_memory_mib": 64, "reserved_cpu_milli": 0,
                 "template": name, "template_spec": template, "worker_image": worker_image,
                 "sandbox_config": base["sandboxConfig"]["configName"], "legacy": not candidate}
     return {"mode": "active" if candidate else "quiescing", "default_id": profile_id,
@@ -89,7 +95,9 @@ def bootstrap(args):
     base = next(item for item in old if item["metadata"]["name"] == args.template)
     if args.candidate and args.catalog == "worker-profiles":
         raise ValueError("Candidate verification requires a separate catalog")
-    value = catalog(base, old, args.node, args.worker_image, args.catalog if args.candidate else None)
+    config = load()
+    value = catalog(base, old, args.node, args.worker_image, args.catalog if args.candidate else None,
+                    capacity={"cpu_milli": config["worker_cpu"] * 1000, "memory_mib": config["worker_memory_mib"]})
     if not args.candidate:
         for actor in actors():
             if actor["actorTemplate"]["name"] not in value["bindings"]:
@@ -108,7 +116,8 @@ def stage_candidate(deployment, runtime=None):
     base = copy.deepcopy(production["base_template"])
     if runtime is not None:
         base["containers"][0]["image"] = runtime
-    value = catalog(base, [], production["node"], production["worker_image"], name)
+    standard = next(profile for profile in production["profiles"] if profile["id"] == production["default_id"])
+    value = catalog(base, [], production["node"], production["worker_image"], name, capacity=standard["revisions"][-1])
     catalog_name = "worker-profiles-" + name
     current = kubectl("-n", SPACE, "get", "configmap", catalog_name, "--ignore-not-found", "-o", "json")
     if current.strip():
@@ -127,13 +136,29 @@ def stage_candidate(deployment, runtime=None):
 
 
 def cutover(args):
+    if args.url:
+        pki = Path.home() / ".config/substrate-panel"
+        return migrate_pool(args, Client(args.url, pki / "ca.crt", pki / "password").request)
+    lifecycle = runpy.run_path(str(ROOT / "deploy/host-lifecycle.py"))
+    with lifecycle["forward_panel"]() as forward:
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                lifecycle["request"]("GET", "/api/worker-management")
+                break
+            except RuntimeError:
+                if forward.poll() is not None or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.2)
+        return migrate_pool(args, lifecycle["request"])
+
+
+def migrate_pool(args, request):
     spec = importlib.util.spec_from_file_location("lifecycle", ROOT / "deploy/host-lifecycle.py")
     lifecycle = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(lifecycle)
-    pki = Path.home() / ".config/substrate-panel"
-    client = Client(args.url, pki / "ca.crt", pki / "password")
-    mode = client.request("GET", "/api/worker-management")
-    client.request("PUT", "/api/worker-management", {"mode": "quiescing", "version": mode["version"]})
+    mode = request("GET", "/api/worker-management")
+    request("PUT", "/api/worker-management", {"mode": "quiescing", "version": mode["version"]})
     expected = json.loads((args.backup / "actors.json").read_text())
     before = actors()
     if identity(before) != identity(expected):
@@ -149,23 +174,23 @@ def cutover(args):
         raise RuntimeError("Saved running inventory differs from the checkpoint")
     location = json.loads((ROOT / "images.json").read_text())["snapshotStore"]["location"]
     for actor in running:
-        lifecycle.suspend(actor, client.request, location)
+        lifecycle.suspend(actor, request, location)
     after = actors()
     if identity(after) != identity(expected) or any(lifecycle.saved(actor, location) is None for actor in after):
         raise RuntimeError("Inventory or MEMORY snapshot verification failed; remain quiescing")
     pools = json.loads((args.backup / "workerpools.json").read_text())["items"]
     legacy = next(pool for pool in pools if pool["metadata"]["name"] == "agents")
-    mode = client.request("GET", "/api/worker-management")
-    client.request("PUT", "/api/worker-management", {"mode": "quiescing", "version": mode["version"], "legacy_pool_uid": legacy["metadata"]["uid"]})
+    mode = request("GET", "/api/worker-management")
+    request("PUT", "/api/worker-management", {"mode": "quiescing", "version": mode["version"], "legacy_pool_uid": legacy["metadata"]["uid"]})
     deadline = time.monotonic() + 300
     while kubectl("-n", SPACE, "get", "workerpool", "agents", "--ignore-not-found", "-o", "name").strip():
         if time.monotonic() > deadline:
             raise RuntimeError("Legacy pool deletion did not finish; remain quiescing")
         time.sleep(2)
-    mode = client.request("GET", "/api/worker-management")
-    client.request("PUT", "/api/worker-management", {"mode": "active", "version": mode["version"]})
+    mode = request("GET", "/api/worker-management")
+    request("PUT", "/api/worker-management", {"mode": "active", "version": mode["version"]})
     for name, uid in original_running:
-        restored = client.request("POST", "/api/agents/" + quote(name, safe="") + "/resume?uid=" + quote(uid, safe=""))
+        restored = request("POST", "/api/agents/" + quote(name, safe="") + "/resume?uid=" + quote(uid, safe=""))
         if restored["metadata"]["uid"] != uid:
             raise RuntimeError("Restored sandbox UID differs")
     final = actors()
@@ -189,8 +214,10 @@ def main():
     init.add_argument("--worker-image", required=True)
     migrate = commands.add_parser("cutover")
     migrate.add_argument("--backup", type=Path, required=True)
-    migrate.add_argument("--url", default="https://192.0.2.10:8443")
+    migrate.add_argument("--url")
     args = parser.parse_args()
+    config = load()
+    require_context(config)
     if args.action == "backup":
         backup(args.directory)
     elif args.action == "bootstrap":

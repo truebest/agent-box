@@ -30,7 +30,7 @@ COPY runtime ./runtime
 COPY deploy ./deploy
 COPY tests ./tests
 COPY ci ./ci
-COPY agent.py ./
+COPY agent.py .gitignore .dockerignore ./
 COPY panel/console/install.py ./panel/console/install.py
 COPY vendor/substrate/manifests/ate-install/atenet-egress.yaml ./vendor/substrate/manifests/ate-install/atenet-egress.yaml
 RUN python -m unittest discover -s tests -v

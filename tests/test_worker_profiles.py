@@ -2,7 +2,7 @@ import copy
 import json
 import tempfile
 import types
-from unittest.mock import patch
+from unittest.mock import Mock, MagicMock, patch
 import importlib.util
 from pathlib import Path
 import unittest
@@ -14,6 +14,18 @@ spec.loader.exec_module(profiles)
 
 
 class WorkerProfiles(unittest.TestCase):
+    def test_default_cutover_uses_a_private_forward_and_waits_for_it(self):
+        forward = MagicMock()
+        forward.return_value.__enter__.return_value.poll.return_value = None
+        request = Mock(side_effect=[RuntimeError("starting"), {}])
+        args = types.SimpleNamespace(url=None)
+        with patch.object(profiles.runpy, "run_path", return_value={"forward_panel": forward, "request": request}), \
+                patch.object(profiles.time, "sleep"), patch.object(profiles, "migrate_pool") as migrate:
+            profiles.cutover(args)
+        forward.assert_called_once_with()
+        migrate.assert_called_once_with(args, request)
+        self.assertEqual(request.call_count, 2)
+
     def test_catalog_preserves_images_snapshots_and_isolates_candidate_placement(self):
         base = {'metadata': {'name': 'old', 'uid': 'original-template'},
                 'containers': [{'name': 'app', 'image': 'runtime@sha256:old'}],
@@ -23,7 +35,7 @@ class WorkerProfiles(unittest.TestCase):
                 'snapshotConfig': {'preferredFidelity': 'SNAPSHOT_FIDELITY_MEMORY', 'onSuspend': {'durable': True}}}
         before = copy.deepcopy(base)
         for candidate in (False, True):
-            result = profiles.catalog(base, [base], 'host', 'localhost:5001/substrate/ateom-gvisor@sha256:' + 'a' * 64, 'candidate-test' if candidate else None)
+            result = profiles.catalog(base, [base], 'host', 'localhost:5001/substrate/ateom-gvisor@sha256:' + 'a' * 64, 'candidate-test' if candidate else None, capacity={'cpu_milli': 8000, 'memory_mib': 8256})
             revision = result['profiles'][0]['revisions'][0]
             self.assertEqual(revision['template_spec']['containers'], base['containers'])
             self.assertEqual(revision['template_spec']['snapshotConfig'], base['snapshotConfig'])
@@ -36,10 +48,14 @@ class WorkerProfiles(unittest.TestCase):
             self.assertEqual('old' in result['bindings'], not candidate)
             self.assertNotIn('workload', revision['template_spec']['workerSelector']['matchLabels'])
             self.assertEqual(result['mode'], 'active' if candidate else 'quiescing')
+        small = profiles.catalog(base, [], 'host', 'localhost:5100/substrate/ateom-gvisor@sha256:' + 'a' * 64,
+                                 capacity={'cpu_milli': 2000, 'memory_mib': 3072})['profiles'][0]['revisions'][0]
+        self.assertEqual((small['cpu_milli'], small['memory_mib'], small['slots']), (2000, 2112, 1))
+        self.assertEqual(small['template_spec']['resources'], base['resources'])
         self.assertEqual(before, base)
         base['resources']['limits'][0]['quantity'] = '4'
         with self.assertRaises(ValueError):
-            profiles.catalog(base, [], 'host', 'localhost:5001/substrate/ateom-gvisor@sha256:' + 'a' * 64)
+            profiles.catalog(base, [], 'host', 'localhost:5001/substrate/ateom-gvisor@sha256:' + 'a' * 64, capacity={'cpu_milli': 8000, 'memory_mib': 8256})
 
     def test_inventory_identity_includes_the_uid(self):
         self.assertNotEqual(profiles.identity([{'metadata': {'name': 'same', 'uid': 'before'}}]),
@@ -94,7 +110,7 @@ class WorkerProfiles(unittest.TestCase):
                 "workerSelector": {"matchLabels": {"workload": "pvm-agents"}},
                 "sandboxConfig": {"configName": "gvisor-default", "sandboxClass": "gvisor"},
                 "snapshotConfig": {"preferredFidelity": "SNAPSHOT_FIDELITY_MEMORY"}}
-        production = profiles.catalog(base, [base], "host", "localhost:5001/substrate/ateom-gvisor@sha256:" + "a" * 64)
+        production = profiles.catalog(base, [base], "host", "localhost:5001/substrate/ateom-gvisor@sha256:" + "a" * 64, capacity={"cpu_milli": 8000, "memory_mib": 8256})
         saved = copy.deepcopy(production)
         existing, created = {}, []
         def kube(*args, body=None):

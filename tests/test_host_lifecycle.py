@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("host_lifecycle", ROOT / "deploy/host-lifecycle.py")
 lifecycle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lifecycle)
+lifecycle.load = lambda: {"panel_origin": "https://192.0.2.10:8443", "kube_context": "kind-configured"}
 LOCATION = "s3://fixture-bucket/agent-box-host/"
 
 
@@ -46,6 +47,14 @@ class Pool:
 
 
 class HostLifecycleTests(unittest.TestCase):
+    def test_forward_pins_the_configured_context(self):
+        process = Mock()
+        with patch.object(lifecycle.subprocess, "Popen", return_value=process) as start:
+            with lifecycle.forward_panel():
+                pass
+        self.assertEqual(start.call_args.args[0][:3], ["kubectl", "--context", "kind-configured"])
+        process.terminate.assert_called_once_with()
+
     def test_empty_protobuf_inventory_omits_the_actors_field(self):
         api = Mock(return_value={})
         self.assertEqual(lifecycle.drain_once(api, LOCATION), [])
@@ -191,7 +200,7 @@ class HostLifecycleTests(unittest.TestCase):
                 patch.object(lifecycle.subprocess, "run") as run:
             lifecycle.refresh_worker_pods()
         self.assertEqual(run.call_count, 6)
-        self.assertEqual({call.args[0][5] for call in run.call_args_list}, {"deployment/agents", "deployment/wp-one", "deployment/wp-two"})
+        self.assertEqual({argument for call in run.call_args_list for argument in call.args[0] if argument.startswith("deployment/")}, {"deployment/agents", "deployment/wp-one", "deployment/wp-two"})
 
     def test_candidates_use_api_barriers_or_cas_for_stopped_owners(self):
         catalogs = {"items": [{"metadata": {"name": name, "resourceVersion": "17"},
@@ -225,8 +234,13 @@ class HostLifecycleTests(unittest.TestCase):
 
     def test_unit_orders_public_access_storage_and_docker_around_the_guard(self):
         tree = ast.parse((ROOT / "deploy/host-services.py").read_text())
-        units = ast.literal_eval(next(node.value for node in tree.body if isinstance(node, ast.Assign)
-                                      and any(isinstance(t, ast.Name) and t.id == "units" for t in node.targets)))
+        namespace = {}
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "service_units")
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "host-services.py", "exec"), namespace)
+        units = namespace["service_units"]({"kube_context": "kind-configured", "user": "ubuntu", "home": "/home/ubuntu", "repository": "/opt/agent-box", "config_path": "/opt/agent-box/deploy/install.local.json", "listen_address": "127.0.0.1", "listen_port": 9443})
+        self.assertIn("--address=127.0.0.1 svc/panel 9443:8443", units["substrate-panel.service"])
+        self.assertIn("--context=kind-configured", units["substrate-panel.service"])
+        self.assertIn("User=ubuntu", units["substrate-lifecycle.service"])
         guard, panel = units["substrate-lifecycle.service"], units["substrate-panel.service"]
         self.assertIn("TimeoutStopSec=infinity", guard)
         self.assertIn("RemainAfterExit=yes", guard)
@@ -239,11 +253,13 @@ class HostLifecycleTests(unittest.TestCase):
 
     def test_kind_restart_reapplies_proxy_settings_in_the_mount_service(self):
         tree = ast.parse((ROOT / "deploy/prepare-host.py").read_text())
-        script = ast.literal_eval(next(node.value for node in tree.body if isinstance(node, ast.Assign)
-                                       and any(isinstance(t, ast.Name) and t.id == "mount_script" for t in node.targets)))
+        namespace = {}
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "mount_script")
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "prepare-host.py", "exec"), namespace)
+        script = namespace["mount_script"]({"workspace_mount": "/srv/workspace", "volume_group": "workspaces", "workspace_volume": "substrate-ate", "kind_node": "test-control-plane"})
         startup = script.split("while test", 1)[0]
-        self.assertIn('docker exec "$node" sysctl net.ipv4.conf.all.proxy_arp=1', startup)
-        self.assertIn('docker exec "$node" sysctl -e net.ipv6.conf.all.proxy_ndp=1', startup)
+        self.assertIn('docker exec test-control-plane sysctl net.ipv4.conf.all.proxy_arp=1', startup)
+        self.assertIn('docker exec test-control-plane sysctl -e net.ipv6.conf.all.proxy_ndp=1', startup)
 
 
 if __name__ == "__main__":

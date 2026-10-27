@@ -18,6 +18,12 @@ spec.loader.exec_module(panel_image)
 
 
 class CI(unittest.TestCase):
+    def setUp(self):
+        config = {"registry_address": "localhost:5001", "registry_url": "http://127.0.0.1:5001", "repository": "/opt/agent-box", "storage_class": "agent-thin"}
+        for patcher in (patch.object(panel_image, "load", return_value=config), patch.object(panel_image, "require_context")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_deploy_key_is_private_scoped_and_removed_on_success_or_failure(self):
         for fail in (False, True):
             with self.subTest(fail=fail), tempfile.TemporaryDirectory() as temporary:
@@ -44,6 +50,8 @@ assert stat.S_IMODE(key.parent.stat().st_mode) == 0o700
 assert 'AGENT_BOX_DEPLOY_SSH_KEY_B64' not in os.environ
 assert 'StrictHostKeyChecking=yes' in args
 assert 'UserKnownHostsFile=ci/known_hosts' in args
+if 'python3' in args[-1]:
+    assert "AGENT_BOX_CONFIG='/secure/agent-box.json'" in args[-1]
 with open(os.environ['DEPLOY_TRACE'], 'a') as output:
     output.write(json.dumps(str(key)) + '\\n')
 sys.exit(1 if os.environ['DEPLOY_FAIL'] == '1' else 0)
@@ -54,6 +62,7 @@ sys.exit(1 if os.environ['DEPLOY_FAIL'] == '1' else 0)
                     executable.chmod(0o755)
                 trace = root / "trace.jsonl"
                 env = dict(os.environ, SOURCE_BRANCH="main", SOURCE_REVISION=revision, BUILD_NUMBER="5",
+                           AGENT_BOX_DEPLOY_CONFIG="/secure/agent-box.json", AGENT_BOX_DEPLOY_TARGET="ubuntu@192.0.2.10", AGENT_BOX_INSTALL_DIR="/home/ubuntu/agent-box",
                            AGENT_BOX_DEPLOY_SSH_KEY_B64=base64.b64encode(b"test-only-key").decode(),
                            PATH=str(root / "bin") + os.pathsep + os.environ["PATH"], DEPLOY_TRACE=str(trace), DEPLOY_FAIL="1" if fail else "0")
                 result = subprocess.run(["sh", str(ROOT / "ci/deploy.sh")], cwd=root, env=env, capture_output=True)
@@ -157,6 +166,9 @@ sys.exit(1 if os.environ['DEPLOY_FAIL'] == '1' else 0)
                     (live / "deploy").mkdir()
                     (live / "deploy/host-lifecycle.py").write_text("old lifecycle")
                     (directory / "host-lifecycle.py").write_text("new lifecycle")
+                    (directory / "configuration.py").write_text("new configuration")
+                    if failure == "health":
+                        (live / "deploy/configuration.py").write_text("old configuration")
                 previous = {"spec": {"template": {"spec": {"containers": [{"name": "panel", "image": "old-image"}], "volumes": [{"name": "original"}]}}}}
                 commands = []
 
@@ -200,6 +212,10 @@ sys.exit(1 if os.environ['DEPLOY_FAIL'] == '1' else 0)
                 self.assertEqual(json.loads((directory / "previous-panel.json").read_text()), previous)
                 if profiles_enabled:
                     self.assertEqual((live / "deploy/host-lifecycle.py").read_text(), "old lifecycle")
+                    if failure == "health":
+                        self.assertEqual((live / "deploy/configuration.py").read_text(), "old configuration")
+                    else:
+                        self.assertFalse((live / "deploy/configuration.py").exists())
 
     def test_catalog_sources_refresh_without_rewriting_versions(self):
         catalog = {"worker_image": "old-worker", "base_template": {"containers": [{"image": "old-runtime"}]},

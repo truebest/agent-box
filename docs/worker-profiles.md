@@ -14,6 +14,10 @@ Worker CPU = sandbox CPU × slots
 Worker memory = sandbox memory × slots + 64 MiB
 ```
 
+The bootstrap profile fits within `worker_cpu` and `worker_memory` from the
+installation configuration. With the default 2 CPU and 3 GiB Worker, it starts
+with one 2 CPU, 2048 MiB sandbox slot and a 64 MiB service reserve.
+
 For example, four slots of 2 CPU and 2048 MiB use a Worker allocation of 8000
 millicores and 8256 MiB. Changing the slot count preserves each sandbox's limits.
 
@@ -109,7 +113,8 @@ The main catalog starts in `quiescing` mode. After enabling the panel and
 verifying the new configuration, complete the cutover:
 
 ```sh
-python3 deploy/worker-profiles.py cutover --url https://panel.example.com:8443 --backup /secure/path/profiles-backup
+python3 deploy/worker-profiles.py cutover --backup /secure/path/profiles-backup
+sudo systemctl restart substrate-panel.service
 ```
 
 Cutover saves and verifies snapshots, replaces the fixed `agents` pool with

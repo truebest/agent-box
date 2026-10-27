@@ -4,6 +4,10 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deploy"))
 
 spec = importlib.util.spec_from_file_location("configure_r2", Path(__file__).resolve().parents[1] / "deploy/configure-r2.py")
 r2 = importlib.util.module_from_spec(spec)
@@ -11,6 +15,19 @@ spec.loader.exec_module(r2)
 
 
 class R2ConfigTests(unittest.TestCase):
+    def test_storage_switch_is_refused_after_profile_bootstrap(self):
+        with patch.object(r2, "load", return_value={}), patch.object(r2, "require_context"), \
+                patch.object(r2, "run", return_value=b"configmap/worker-profiles"), \
+                patch.object(r2, "settings") as settings, self.assertRaises(RuntimeError):
+            r2.main()
+        settings.assert_not_called()
+
+    def test_storage_migration_includes_the_selected_sandbox_template(self):
+        with patch.object(r2, "template", side_effect=lambda name: {"name": name}):
+            self.assertEqual(set(r2.storage_templates({"sandbox": {"template": "sandbox-v1-example"}})),
+                             {"codex", "pi", "sandbox-v1-example"})
+            self.assertEqual(set(r2.storage_templates({})), {"codex", "pi"})
+
     def test_settings_and_secret_references(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)

@@ -44,3 +44,4 @@ vendor/substrate/pvm-panel
 **/*.har
 **/*.sqlite
 **/*.sqlite3
+/deploy/install.local.json

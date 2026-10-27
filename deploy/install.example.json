@@ -1,0 +1,23 @@
+{
+  "repository": "/home/ubuntu/agent-box",
+  "hostname": "agent-box",
+  "user": "ubuntu",
+  "home": "/home/ubuntu",
+  "panel_origin": "https://panel.example.com:8443",
+  "listen_address": "127.0.0.1",
+  "kind_cluster": "agent-box",
+  "registry_name": "agent-box-registry",
+  "registry_port": 5001,
+  "registry_volume": "agent-box-registry",
+  "registry_driver": "local",
+  "volume_group": "workspaces",
+  "thin_pool": "pool",
+  "workspace_volume": "substrate-ate",
+  "workspace_size": "256G",
+  "workspace_mount": "/srv/substrate-ate",
+  "storage_class": "standard",
+  "worker_cpu": 2,
+  "worker_memory": "3Gi",
+  "worker_replicas": 1,
+  "listen_port": 8443
+}

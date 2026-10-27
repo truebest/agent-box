@@ -12,8 +12,9 @@ from urllib.parse import quote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from agent import Client
+sys.path.insert(0, str(ROOT / "deploy"))
+from configuration import load
 
-URL = "https://192.0.2.10:8443"
 PRIVATE_PORT = 19443
 
 
@@ -22,7 +23,7 @@ class RecoveryRequired(RuntimeError):
 
 
 def request(method, path, body=None, *, port=PRIVATE_PORT, identity=None):
-    url = URL
+    url = load()["panel_origin"]
     pki = Path.home() / ".config/substrate-panel"
     if identity == "devin-pilot":
         pki = Path.home() / ".config/devin-agent-box-pilot"
@@ -34,7 +35,7 @@ def request(method, path, body=None, *, port=PRIVATE_PORT, identity=None):
     command = ["curl", "--disable", "--silent", "--show-error", "--fail-with-body",
                "--noproxy", "*", "--proto", "=https", "--max-time", "360",
                "--cacert", str(pki / "ca.crt"), "--connect-to",
-               f"{host}:8443:127.0.0.1:{port}",
+               f"{host}:{urlsplit(url).port or 443}:127.0.0.1:{port}",
                "--config", "-", "--request", method, url + path]
     if method in ("POST", "PUT"):
         command += ["--header", "Content-Type: application/json", "--data", json.dumps(body or {})]
@@ -92,7 +93,7 @@ def drain_once(api, location):
 
 @contextmanager
 def forward_panel(target="svc/panel", port=PRIVATE_PORT):
-    process = subprocess.Popen(["kubectl", "-n", "pvm-agents", "port-forward", "--address=127.0.0.1",
+    process = subprocess.Popen(["kubectl", "--context", load()["kube_context"], "-n", "pvm-agents", "port-forward", "--address=127.0.0.1",
                                 target, f"{port}:8443"],
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
@@ -107,7 +108,7 @@ def forward_panel(target="svc/panel", port=PRIVATE_PORT):
 
 
 def management_mode(mode):
-    catalog = subprocess.check_output(["kubectl", "-n", "pvm-agents", "get", "configmap", "worker-profiles", "--ignore-not-found", "-o", "name"])
+    catalog = subprocess.check_output(["kubectl", "--context", load()["kube_context"], "-n", "pvm-agents", "get", "configmap", "worker-profiles", "--ignore-not-found", "-o", "name"])
     if not catalog.strip():
         return
     current = request("GET", "/api/worker-management")
@@ -124,7 +125,7 @@ def quiesce_candidates():
 
 
 def candidate_management(mode, persistent_only=False):
-    command = ["kubectl", "-n", "pvm-agents"]
+    command = ["kubectl", "--context", load()["kube_context"], "-n", "pvm-agents"]
     catalogs = json.loads(subprocess.check_output(command + ["get", "configmaps", "-l", "agent-box/worker-catalog=true", "-o", "json"]))
     for cm in catalogs["items"]:
         if cm["metadata"]["name"] == "worker-profiles":
@@ -163,15 +164,15 @@ def candidate_management(mode, persistent_only=False):
 
 
 def refresh_worker_pods():
-    pools = json.loads(subprocess.check_output(["kubectl", "-n", "pvm-agents", "get", "workerpools", "-o", "json"]))
+    pools = json.loads(subprocess.check_output(["kubectl", "--context", load()["kube_context"], "-n", "pvm-agents", "get", "workerpools", "-o", "json"]))
     for pool in pools["items"]:
         if pool["metadata"].get("deletionTimestamp") or not pool["spec"]["replicas"]:
             continue
         if pool["metadata"]["name"] != "agents" and pool["metadata"].get("labels", {}).get("agent-box/managed") != "true":
             continue
         deployment = "deployment/" + pool["metadata"]["name"]
-        subprocess.run(["kubectl", "-n", "pvm-agents", "rollout", "restart", deployment], check=True)
-        subprocess.run(["kubectl", "-n", "pvm-agents", "rollout", "status", deployment, "--timeout=300s"], check=True)
+        subprocess.run(["kubectl", "--context", load()["kube_context"], "-n", "pvm-agents", "rollout", "restart", deployment], check=True)
+        subprocess.run(["kubectl", "--context", load()["kube_context"], "-n", "pvm-agents", "rollout", "status", deployment, "--timeout=300s"], check=True)
 
 
 def main(mode):

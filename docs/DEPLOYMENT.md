@@ -6,44 +6,116 @@ your installation before running them.
 
 ## Requirements
 
-| Component | Purpose |
+Use a dedicated Linux x86-64 host with systemd, Docker, Python 3.10 or newer, Git, OpenSSL,
+LVM and XFS tools. For the default single-node setup with Worker profiles,
+provide at least 8 CPU cores and 8 GiB of RAM. Image builds require internet access. Allow room for the
+Kubernetes node image, runtime images, registry, database and snapshots.
+
+The installation uses a single-node KIND cluster. Kubernetes runs Substrate,
+PostgreSQL, RustFS, Worker Pods and the panel. Workers run gVisor sandboxes.
+Workspace staging uses an XFS logical volume from an existing LVM thin pool.
+PostgreSQL, RustFS and panel sessions use the configured Kubernetes StorageClass.
+The registry uses a local Docker volume by default.
+
+The included Substrate manifests enable ClusterTrustBundle,
+ClusterTrustBundleProjection and PodCertificateRequest. Cloudflare Tunnel and
+Access are optional. See [ingress setup](CLOUDFLARE.md).
+
+## Installation
+
+Clone the repository and build the pinned installation tools:
+
+```sh
+git clone https://github.com/truebest/agent-box.git
+cd agent-box
+sh deploy/build-tools.sh
+sudo install -m 755 vendor/substrate/bin/kind vendor/substrate/bin/kubectl /usr/local/bin/
+```
+
+The other two tools, `ate-setup` and `kubectl-ate`, stay in
+`vendor/substrate/bin/`. Run deployment commands from the repository root as a
+user with Docker access. Use `sudo` only for the host preparation and service
+installation commands shown below.
+
+Create the local configuration:
+
+```sh
+cp deploy/install.example.json deploy/install.local.json
+chmod 600 deploy/install.local.json
+```
+
+Edit the file for your host. It is excluded from Git and Docker build contexts.
+Set `repository` to the absolute path of this checkout.
+Deployment commands read it automatically. `AGENT_BOX_CONFIG` selects another
+file when needed. Pass that selection explicitly through `sudo` for privileged
+commands:
+
+```sh
+export AGENT_BOX_CONFIG=/secure/agent-box/install.json
+sudo env AGENT_BOX_CONFIG="$AGENT_BOX_CONFIG" python3 deploy/prepare-host.py
+sudo env AGENT_BOX_CONFIG="$AGENT_BOX_CONFIG" python3 deploy/host-services.py
+```
+
+| Settings | What to set |
 | --- | --- |
-| Docker and KIND | Kubernetes containers and OCI images |
-| Kubernetes | Substrate controllers, projected workload identities and Workers |
-| Substrate v0.5.0 | Control plane, scheduling, routing and MEMORY snapshots |
-| gVisor / runsc | Sandbox runtime |
-| LVM, XFS and TopoLVM | Workspace volumes and snapshot staging |
-| `workspace-lvm` Docker volume driver | Host volume integration used by `prepare-host.py` |
-| OCI registry | Images required to create and restore sandboxes |
-| PostgreSQL | Substrate control-plane data |
-| RustFS | Local S3-compatible storage used by the bootstrap manifests |
-| S3/R2 object storage | Sandbox snapshots |
-| systemd | Host services, shutdown and boot recovery |
+| `hostname`, `user`, `home`, `repository` | Hostname, installation account and absolute checkout path |
+| `panel_origin` | Browser-facing HTTPS origin, including its port |
+| `listen_address`, `listen_port` | Local HTTPS listener, `127.0.0.1:8443` by default |
+| `kind_cluster` | Name for a new KIND cluster |
+| `registry_name`, `registry_port`, `registry_volume`, `registry_driver` | Local registry container, port and Docker volume |
+| `volume_group`, `thin_pool` | Existing LVM thin pool on a dedicated data disk |
+| `workspace_volume`, `workspace_size`, `workspace_mount` | Thin LV to create and its dedicated, empty mount directory |
+| `storage_class` | Kubernetes StorageClass for PostgreSQL, RustFS and panel sessions |
+| `worker_cpu`, `worker_memory`, `worker_replicas` | Initial Worker requests and limits, and pool size |
 
-Choose Kubernetes feature gates and runtime versions compatible with the
-included [Substrate source](../vendor/substrate/README.md). The manifests use
-ClusterTrustBundle, ClusterTrustBundleProjection and PodCertificateRequest.
-Cloudflare Tunnel and Access are optional. See [ingress setup](CLOUDFLARE.md).
+The default Worker is 2 CPUs and 3 GiB. Leave additional capacity for Kubernetes
+and the control plane. The default sandbox limit is 2 CPUs and 2 GiB.
 
-## Installation settings
+Provision the LVM thin pool before continuing. Inspect `sudo vgs` and `sudo lvs`
+to confirm its name and available capacity. Host preparation creates and formats
+a new workspace LV. An existing LV must already use XFS. It refuses a mount
+occupied by another device or an unmounted directory containing files.
 
-Review hostnames, operator paths, KIND context, registry, panel address, TLS SANs,
-storage classes, node selectors, bucket and snapshot prefix in `deploy/`,
-`ci/deploy.sh` and `agent.py`. Replace example values with your own configuration.
+Prepare the volume, create Kubernetes, and install its mount service:
 
-`deploy/prepare-host.py` configures host mounts, LVM, sysctls, Kubernetes features
-and systemd. Install the volume driver it expects before running it.
-`deploy/prepare-cluster.py` creates storage secrets and configures the registry.
-Review these scripts before applying changes to a host.
+```sh
+sudo python3 deploy/prepare-host.py
+python3 deploy/create-cluster.py
+sudo python3 deploy/prepare-host.py
+python3 deploy/prepare-cluster.py
+```
 
-Build images with `sh ci/check.sh` and publish them to your registry.
-`deploy/build-images.sh` uses its configured local registry. Record the immutable
-image digests in a local `images.json` for the deployment scripts.
+Cluster creation refuses to replace an existing cluster. The other deployment
+commands check that the selected Kubernetes context matches the configuration.
+The registry listens on loopback and the private KIND bridge. Kubernetes
+reaches it through the bridge gateway, which keeps its address stable when the
+registry container is recreated.
 
-The included Substrate manifests contain the required integration changes.
-`deploy/configure-release.py` applies those changes to a clean upstream tree.
-Use `deploy/deploy-agents.py` for bootstrap and configure
-[Worker profiles](worker-profiles.md) for sandbox capacity.
+Build and publish images, install Substrate, then deploy Agent Box:
+
+```sh
+sh deploy/build-images.sh
+python3 deploy/install-substrate.py
+python3 deploy/deploy-agents.py
+sudo python3 deploy/host-services.py
+```
+
+The included manifests already contain the integration changes.
+`deploy/configure-release.py` applies those changes when importing a clean
+upstream tree.
+
+Bootstrap creates local panel credentials, a CA and a server certificate for
+`panel_origin`. The panel password is in
+`~/.config/substrate-panel/password`. Trust the CA from
+`~/.config/substrate-panel/ca.crt` on your client and open the configured origin.
+The sign-in name is `admin`. For remote access, configure a reachable
+`listen_address` and `listen_port`, or an HTTPS ingress that forwards to the local
+listener and preserves the canonical origin. The origin port can differ from the
+local listener port.
+
+`images.json` records the installed image digests and snapshot location. Keep it
+with the local configuration and credential backups. Use
+[Worker profiles](worker-profiles.md) to configure additional sandbox capacity.
 
 ## Credentials
 
@@ -59,20 +131,26 @@ Provision credentials in owner-only files and Kubernetes Secrets.
 | Optional Tunnel token | Secret `agent-box-cloudflare-token` |
 | Deployment SSH key and trusted host keys | Deployment environment and local `ci/known_hosts` |
 
+Empty workspaces and shells can start before provider authentication is configured.
 Codex and Pi receive access-only credentials from the central OAuth source.
 `substrate-auth.timer` and `deploy/refresh-auth.sh` refresh authentication.
+The timer is enabled when a central OAuth source exists during service installation.
+Run `sudo python3 deploy/host-services.py` after adding it to enable refresh.
 Devin CLI signs in with its own account. See [Devin CLI](DEVIN_CLI.md).
 
 ## Snapshot storage
 
 The snapshot backend uses the S3 API, including Amazon S3 and Cloudflare R2.
-Configure an HTTPS endpoint, region, bucket and snapshot prefix for your provider.
+Bootstrap uses the bundled RustFS service and bucket `ate-snapshots`.
+For external storage, configure an HTTPS endpoint, region, bucket and snapshot
+prefix for your provider.
 
 `deploy/configure-r2.py` configures Cloudflare R2. Its validation requires an R2
 endpoint, the configured bucket and region `auto`. Adapt that validation and the
 network policy when configuring another S3 provider. The configuration paths and
 Secret use the name `substrate-r2`.
 
+Configure external snapshot storage before bootstrapping Worker profiles.
 The script requires an empty Actor list before changing storage. MEMORY
 snapshots contain processes, credentials, conversations and files. Protect the
 bucket and keep the images and runtime versions needed for restore.
@@ -104,7 +182,12 @@ The Python client pins the first UID observed for each name during its lifetime.
 ## Updates and recovery
 
 Test image and configuration changes in an isolated deployment with disposable
-sandboxes. Save the current configuration and image digests before updating.
+sandboxes. For SSH deployment with `ci/deploy.sh`, set
+`AGENT_BOX_DEPLOY_TARGET` to `user@host` and `AGENT_BOX_INSTALL_DIR` to the
+configured checkout path. Set `AGENT_BOX_DEPLOY_CONFIG` when the remote
+installation uses a configuration file outside `deploy/install.local.json`.
+Release archives are stored under its
+`archives/releases/` directory. Save the current configuration and image digests before updating.
 `deploy/panel-image.py` verifies image archives and rolls back a failed panel
 update. `deploy/refresh-native-runtime.py` creates runtime revisions for future
 sandboxes while preserving existing templates and sandbox identities.
